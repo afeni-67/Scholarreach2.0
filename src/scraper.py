@@ -64,6 +64,30 @@ def _get(url: str, session: Optional[requests.Session] = None, retries: int = 3)
     raise last_err  # type: ignore
 
 
+
+def paper_download_candidates(article_url: str) -> List[str]:
+    """
+    Synthesize direct download URLs from paper view pages.
+    IJIRCT: viewPaper.php?paperId=2606017 → download.php?a_pid=2606017
+    """
+    out = []
+    m = re.search(r"viewpaper\.php\?([^#]*)", article_url, re.I)
+    if m:
+        qs = m.group(1)
+        pid = None
+        for part in qs.split("&"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                if k.lower() in ("paperid", "paper_id", "id", "pid", "a_pid"):
+                    pid = v
+                    break
+        if pid:
+            base = article_url.split("viewpaper.php", 1)[0]
+            out.append(f"{base}download.php?a_pid={pid}")
+            out.append(f"{base}download.php?paperId={pid}")
+    return out
+
+
 def ojs_download_candidates(article_view_url: str) -> List[str]:
     """
     OJS: /article/view/1234  →  try /article/download/1234 and /article/download/1234/XXXX
@@ -171,6 +195,15 @@ def classify_link(url: str, text_hint: str = "") -> Optional[str]:
         return "article"
     if "abstract" in u and re.search(r"view|full", u, re.I):
         return "article"
+    # IJIRCT / custom PHP journals
+    if re.search(r"viewpaper\.php\?.*paperid=", u, re.I):
+        return "article"
+    if re.search(r"view[_-]?paper\.php", u, re.I) and re.search(r"id=", u, re.I):
+        return "article"
+    if re.search(r"download\.php\?.*a_pid=", u, re.I):
+        return "pdf"
+    if re.search(r"download\.php\?.*paper", u, re.I):
+        return "pdf"
 
     # DSpace / EPrints handles
     if re.search(r"/handle/\d+/\d+", u, re.I):
@@ -207,6 +240,10 @@ def classify_link(url: str, text_hint: str = "") -> Optional[str]:
     if re.search(r"vol[_-]?\d+.*\.(htm|html|php)", u, re.I):
         return "listing"
     if re.search(r"browse|viewall|all-issues|past-issues|current-issue|back.?issues", u, re.I):
+        return "listing"
+    if re.search(r"publications\.php", u, re.I) and re.search(r"volume=|issue=", u, re.I):
+        return "listing"
+    if re.search(r"publications\.php", u, re.I):
         return "listing"
     if re.search(r"contents?\.htm", u, re.I) or re.search(r"toc\.htm", u, re.I):
         return "listing"
@@ -404,9 +441,9 @@ def generic_discover(
                         }
                     )
             elif kind == "article":
-                # OJS: synthesize download URLs so we don't need to open every article HTML page
-                for cand in ojs_download_candidates(href):
-                    if "download" in cand and cand not in seen_pdfs:
+                # OJS + IJIRCT-style: synthesize download URLs without opening every HTML page
+                for cand in ojs_download_candidates(href) + paper_download_candidates(href):
+                    if cand not in seen_pdfs:
                         seen_pdfs.add(cand)
                         pdfs.append(
                             {
@@ -414,7 +451,7 @@ def generic_discover(
                                 "authors": None,
                                 "pdf_url": cand,
                                 "doi": None,
-                                "source": "ojs_synth",
+                                "source": "synth_download",
                                 "page_url": href,
                             }
                         )
