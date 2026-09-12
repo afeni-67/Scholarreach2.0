@@ -24,9 +24,9 @@ from src.config import USER_AGENT, REQUEST_TIMEOUT, REQUEST_SLEEP
 
 logger = logging.getLogger(__name__)
 
-MAX_PAGES = 80
-MAX_DEPTH = 3
-MAX_PDFS = 400
+MAX_PAGES = 200
+MAX_DEPTH = 4
+MAX_PDFS = 800
 
 
 def _session() -> requests.Session:
@@ -109,9 +109,23 @@ def _resolve(href: str, base: str) -> Optional[str]:
         return None
 
 
+def _registrable(host: str) -> str:
+    """Rough eTLD+1: arpnjournals.com / arpnjournals.org → arpnjournals"""
+    host = (host or "").lower().split(":")[0]
+    parts = host.split(".")
+    if len(parts) >= 2:
+        return parts[-2]  # good enough for most journal hosts
+    return host
+
+
 def _same_site(url: str, origin: str) -> bool:
     try:
-        return urlparse(url).netloc == urlparse(origin).netloc
+        a = urlparse(url).netloc.lower()
+        b = urlparse(origin).netloc.lower()
+        if a == b:
+            return True
+        # Allow sibling TLDs of the same journal (e.g. .com archive → .org PDFs)
+        return _registrable(a) == _registrable(b) and _registrable(a) != ""
     except Exception:
         return False
 
@@ -178,18 +192,27 @@ def classify_link(url: str, text_hint: str = "") -> Optional[str]:
     if re.search(r"/works?/\d+|/node/\d+", u, re.I) and not re.search(r"archive|issue|volume", u, re.I):
         return "article"
 
-    # Listing / archive / issue pages
+    # Listing / archive / issue / volume TOC pages (ARPN, many society journals)
     if re.search(r"issue/(view|archive|current)", u, re.I):
         return "listing"
-    if re.search(r"/archive", u, re.I):
+    if re.search(r"/archive(\.htm|/|$|\?)", u, re.I) or u.rstrip("/").endswith("archive.htm"):
         return "listing"
     if re.search(r"list-\d+", u, re.I):
         return "listing"
     if re.search(r"/issue[s]?/", u, re.I) or re.search(r"/volume[s]?/", u, re.I):
         return "listing"
-    if re.search(r"browse|viewall|all-issues|past-issues|current-issue", u, re.I):
+    # ARPN-style: volume_01_2026.htm, volume_12_2019.html
+    if re.search(r"volume[_-]?\d+", u, re.I):
         return "listing"
-    if "issue" in t and ("view" in t or "archive" in t or "list" in t):
+    if re.search(r"vol[_-]?\d+.*\.(htm|html|php)", u, re.I):
+        return "listing"
+    if re.search(r"browse|viewall|all-issues|past-issues|current-issue|back.?issues", u, re.I):
+        return "listing"
+    if re.search(r"contents?\.htm", u, re.I) or re.search(r"toc\.htm", u, re.I):
+        return "listing"
+    if "issue" in t and ("view" in t or "archive" in t or "list" in t or re.search(r"\d", t)):
+        return "listing"
+    if re.search(r"^issue\s*\d+", t, re.I) or re.search(r"volume\s*\d+", t, re.I):
         return "listing"
 
     return None
