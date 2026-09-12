@@ -74,7 +74,7 @@ In the repo → Settings → Secrets and variables → Actions:
 | `MONGODB_URI`  | same Atlas URI                             |
 | `MONGODB_DB`   | `scholarreach`                             |
 | `GITHUB_TOKEN` | same PAT (for /trigger-actions)            |
-| `GITHUB_REPO`  | `afeniabiodun12-ship-it/Scholarreach2.0`   |
+| `GITHUB_REPO`  | `afeni-67/Scholarreach2.0`   |
 | `API_KEY`      | any random string (optional protection)    |
 
 ### 4. Seed the first jobs

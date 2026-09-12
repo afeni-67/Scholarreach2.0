@@ -17,7 +17,7 @@ services:
       - key: GITHUB_TOKEN
         sync: false          # set this in the Render dashboard (your PAT)
       - key: GITHUB_REPO
-        value: afeniabiodun12-ship-it/Scholarreach2.0
+        value: afeni-67/Scholarreach2.0
       - key: API_KEY
         sync: false          # invent any random string and set it here
       - key: PYTHON_VERSION
