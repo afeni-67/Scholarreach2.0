@@ -48,31 +48,49 @@ def process_app_extraction_job(job: dict, worker_id: str) -> None:
 
     seeds = app_jobs.get_journal_seed_urls(journal, user_id)
     listing_urls = seeds.get("listingUrls") or []
-    pdf_urls = list(seeds.get("pdfUrls") or [])
+    seed_pdfs = list(seeds.get("pdfUrls") or [])
     sample_urls = seeds.get("samplePaperUrls") or []
 
-    # Discover from listing pages
-    seen = set(pdf_urls)
-    for i, listing in enumerate(listing_urls):
-        try:
-            app_jobs.update_job_progress(
-                job_id,
-                stage=f"Scanning listing {i+1}/{len(listing_urls)}…",
-                current_url=listing,
-                progress=min(15, 3 + i * 2),
-            )
-            papers = discover_papers(listing)
-            for p in papers:
-                u = p.get("pdf_url")
-                if u and u not in seen:
-                    seen.add(u)
-                    pdf_urls.append(u)
-        except Exception as e:
-            logger.warning("Discover failed for %s: %s", listing, e)
+    # Fallback built-in listing pages when no custom seeds exist
+    if not listing_urls and not seed_pdfs and not sample_urls:
+        if journal == "ijetrm":
+            listing_urls = [
+                "https://ijetrm.com/issue/?volume=current",
+                "https://ijetrm.com/issue/?volume=February~2026",
+                "https://ijetrm.com/issue/?volume=March~2026",
+            ]
+        elif journal == "ijddt":
+            listing_urls = ["https://ijddt.com/"]
 
-    # Also include any sample paper URLs as PDFs if they look like PDFs
-    for u in sample_urls:
-        if u and u.lower().endswith(".pdf") and u not in seen:
+    app_jobs.update_job_progress(
+        job_id,
+        stage=f"Discovering papers for {journal} (generic crawler)…",
+        progress=5,
+        current_url=(listing_urls[0] if listing_urls else ""),
+    )
+
+    from src.scraper import discover_from_seeds
+
+    try:
+        papers = discover_from_seeds(
+            listing_urls=listing_urls,
+            pdf_urls=seed_pdfs,
+            sample_paper_urls=sample_urls,
+        )
+    except Exception as e:
+        logger.exception("Discovery failed for job %s: %s", job_id, e)
+        app_jobs.complete_app_job(
+            job_id,
+            success=False,
+            stage=f"Discovery failed: {str(e)[:100]}",
+        )
+        return
+
+    pdf_urls = []
+    seen = set()
+    for p in papers:
+        u = p.get("pdf_url")
+        if u and u not in seen:
             seen.add(u)
             pdf_urls.append(u)
 
