@@ -103,15 +103,44 @@ def process_app_extraction_job(job: dict, worker_id: str) -> None:
         )
         return
 
+    # --- Checkpoint: skip PDFs already processed for this job ---
+    already = app_jobs.get_already_processed_pdfs(job_id)
+    if already:
+        before = len(pdf_urls)
+        pdf_urls = [u for u in pdf_urls if u not in already]
+        logger.info(
+            "Job %s checkpoint: skipping %d already-processed PDFs, %d remaining",
+            job_id, before - len(pdf_urls), len(pdf_urls),
+        )
+
+    # Restore email/paper counts from DB so UI doesn't reset
+    existing_emails = int(job.get("emailsCollected") or 0)
+    existing_papers = int(job.get("papersProcessed") or 0)
+    if existing_emails == 0:
+        # count from jobemails as source of truth
+        try:
+            existing_emails = app_jobs.job_emails().count_documents({"jobId": job_id})
+        except Exception:
+            pass
+
     app_jobs.update_job_progress(
         job_id,
-        stage=f"Found {len(pdf_urls)} PDFs — extracting emails…",
-        progress=20,
-        papers_processed=0,
+        stage=f"Found {len(pdf_urls) + len(already)} PDFs ({len(already)} done, {len(pdf_urls)} left) — extracting…",
+        progress=max(20, min(90, int(100 * len(already) / max(len(already) + len(pdf_urls), 1)))),
+        papers_processed=existing_papers or len(already),
+        emails_collected=existing_emails,
     )
 
-    emails_total = 0
-    papers_done = 0
+    if not pdf_urls:
+        app_jobs.complete_app_job(
+            job_id,
+            success=True,
+            stage=f"Done — {existing_emails} emails (all discovered PDFs already processed)",
+        )
+        return
+
+    emails_total = existing_emails
+    papers_done = existing_papers or len(already)
     errors = 0
 
     # Parallel PDF extraction inside this worker (biggest speed win).
@@ -144,6 +173,7 @@ def process_app_extraction_job(job: dict, worker_id: str) -> None:
 
             if err is not None:
                 errors += 1
+                app_jobs.mark_pdf_processed(job_id, pdf_url)  # don't retry this URL forever
                 if errors <= 5 or errors % 20 == 0:
                     logger.warning("Extract failed %s: %s", pdf_url, err)
                 continue
@@ -151,6 +181,7 @@ def process_app_extraction_job(job: dict, worker_id: str) -> None:
             title = (result or {}).get("title") or ""
             emails = (result or {}).get("emails") or []
             added = app_jobs.push_emails_for_job(job, emails, paper_url=pdf_url, title=title)
+            app_jobs.mark_pdf_processed(job_id, pdf_url)
             emails_total += added
             papers_done += 1
 

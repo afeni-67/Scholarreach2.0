@@ -210,6 +210,37 @@ def complete_app_job(job_id, *, success: bool = True, stage: str = "Done"):
     )
 
 
+
+def get_already_processed_pdfs(job_id) -> set:
+    """Return set of paperUrl values already stored for this job (checkpoint)."""
+    urls = set()
+    for doc in job_emails().find({"jobId": job_id}, {"paperUrl": 1}):
+        u = (doc.get("paperUrl") or "").strip()
+        if u:
+            urls.add(u)
+    # Also read processedPdfUrls array if present on the job
+    job = extraction_jobs().find_one({"_id": job_id}, {"processedPdfUrls": 1, "papersProcessed": 1})
+    if job:
+        for u in job.get("processedPdfUrls") or []:
+            if u:
+                urls.add(u)
+    return urls
+
+
+def mark_pdf_processed(job_id, pdf_url: str):
+    """Append pdf_url to processedPdfUrls on the job (idempotent-ish)."""
+    if not pdf_url:
+        return
+    extraction_jobs().update_one(
+        {"_id": job_id},
+        {
+            "$addToSet": {"processedPdfUrls": pdf_url},
+            "$set": {"lastHeartbeatAt": datetime.now(timezone.utc), "currentUrl": pdf_url},
+        },
+    )
+
+
+
 def get_journal_seed_urls(journal: str, user_id) -> Dict[str, List[str]]:
     """
     Resolve listing / PDF seed URLs for a journal (built-in or custom).
