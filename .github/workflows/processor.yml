@@ -2,7 +2,7 @@ name: Scholarreach Processor
 
 on:
   schedule:
-    # Every 3 hours → overlapping coverage with 6h max job runtime
+    # Every 3 hours → overlapping coverage with ~6h max runtime
     - cron: "0 */3 * * *"
   workflow_dispatch:
     inputs:
@@ -13,15 +13,21 @@ on:
   repository_dispatch:
     types: [enqueue, process]
 
-# Prevent concurrent runs from fighting too hard (still allow overlap via schedule)
+# Allow overlapping runs from the schedule (do NOT cancel previous ones)
 concurrency:
-  group: scholarreach-processor
+  group: scholarreach-processor-${{ github.run_id }}
   cancel-in-progress: false
 
 jobs:
   process:
     runs-on: ubuntu-latest
     timeout-minutes: 360   # hard limit 6h
+    strategy:
+      fail-fast: false
+      matrix:
+        # 5 parallel workers. Each independently claims jobs from MongoDB.
+        # Atomic claim prevents any two workers from taking the same job.
+        worker: [1, 2, 3, 4, 5]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,19 +43,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run processor loop
+      - name: Run processor loop (worker ${{ matrix.worker }})
         env:
           MONGODB_URI: ${{ secrets.MONGODB_URI }}
           MONGODB_DB: ${{ secrets.MONGODB_DB || 'scholarreach' }}
           GITHUB_TOKEN: ${{ secrets.GH_PAT || github.token }}
           GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_JOB: worker-${{ matrix.worker }}
         run: |
           MAX_H="${{ github.event.inputs.max_hours || '5.5' }}"
           MAX_S=$(python -c "print(int(float('$MAX_H') * 3600))")
-          echo "Starting Scholarreach processor (max ${MAX_S}s)..."
+          echo "Starting Scholarreach worker ${{ matrix.worker }} (max ${MAX_S}s, poll every 3s)..."
           python -c "
           from src.processor import run_loop
-          run_loop(max_runtime_seconds=$MAX_S)
+          run_loop(max_runtime_seconds=$MAX_S, idle_sleep=3)
           "
 
       - name: Queue status summary

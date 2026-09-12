@@ -105,18 +105,21 @@ def run_once(worker_id: str) -> bool:
         return True  # we did work (even if failed)
 
 
-def run_loop(max_runtime_seconds: int = 5 * 3600 + 1800, idle_sleep: int = 20):
+def run_loop(max_runtime_seconds: int = 5 * 3600 + 1800, idle_sleep: int = 3):
     """
     Main loop for a GitHub Actions job.
-    Runs until max_runtime_seconds or until the queue stays empty for a while.
+
+    - Runs for the FULL max_runtime_seconds (never exits early just because queue is empty).
+    - Polls every `idle_sleep` seconds (default 3s) when no work is available.
+    - Multiple parallel workers can safely share the same queue thanks to atomic claiming.
     """
-    worker_id = f"gha-{os.getenv('GITHUB_RUN_ID', 'local')}-{uuid.uuid4().hex[:8]}"
-    logger.info("Worker %s starting (max runtime %ss)", worker_id, max_runtime_seconds)
+    worker_id = f"gha-{os.getenv('GITHUB_RUN_ID', 'local')}-{os.getenv('GITHUB_JOB', 'job')}-{uuid.uuid4().hex[:6]}"
+    logger.info("Worker %s starting (max runtime %ss, idle poll %ss)", worker_id, max_runtime_seconds, idle_sleep)
 
     db.ensure_indexes()
     start = time.time()
-    idle_rounds = 0
     processed = 0
+    last_status_log = 0
 
     while True:
         elapsed = time.time() - start
@@ -127,14 +130,20 @@ def run_loop(max_runtime_seconds: int = 5 * 3600 + 1800, idle_sleep: int = 20):
         had_work = run_once(worker_id)
         if had_work:
             processed += 1
-            idle_rounds = 0
         else:
-            idle_rounds += 1
-            if idle_rounds >= 6:  # ~2 min of pure idle
-                logger.info("Queue empty for several rounds. Processed %d. Exiting early.", processed)
-                break
+            # No job available right now — wait a short time then check again.
+            # We NEVER exit early; we stay alive for the full runtime.
             time.sleep(idle_sleep)
 
+        # Log queue stats every ~5 minutes so we can see activity
+        if elapsed - last_status_log > 300:
+            try:
+                stats = db.count_by_status()
+                logger.info("Queue status (%.0fs elapsed, %d processed): %s", elapsed, processed, stats)
+            except Exception:
+                pass
+            last_status_log = elapsed
+
     stats = db.count_by_status()
-    logger.info("Final queue stats: %s", stats)
+    logger.info("Final queue stats: %s | Total processed this worker: %d", stats, processed)
     return processed
