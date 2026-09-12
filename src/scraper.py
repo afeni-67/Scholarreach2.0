@@ -71,18 +71,18 @@ def paper_download_candidates(article_url: str) -> List[str]:
     IJIRCT: viewPaper.php?paperId=2606017 → download.php?a_pid=2606017
     """
     out = []
-    m = re.search(r"viewpaper\.php\?([^#]*)", article_url, re.I)
+    m = re.search(r"(viewpaper\.php)\?([^#]*)", article_url, re.I)
     if m:
-        qs = m.group(1)
+        qs = m.group(2)
         pid = None
         for part in qs.split("&"):
             if "=" in part:
                 k, v = part.split("=", 1)
                 if k.lower() in ("paperid", "paper_id", "id", "pid", "a_pid"):
-                    pid = v
+                    pid = v.strip()
                     break
         if pid:
-            base = article_url.split("viewpaper.php", 1)[0]
+            base = article_url[: m.start(1)]  # scheme+host+path up to viewPaper.php
             out.append(f"{base}download.php?a_pid={pid}")
             out.append(f"{base}download.php?paperId={pid}")
     return out
