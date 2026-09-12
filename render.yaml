@@ -1,0 +1,24 @@
+# Render Blueprint – deploys the producer service automatically
+# https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: scholarreach-api
+    runtime: python
+    plan: free
+    rootDir: render
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: MONGODB_URI
+        sync: false          # set this in the Render dashboard
+      - key: MONGODB_DB
+        value: scholarreach
+      - key: GITHUB_TOKEN
+        sync: false          # set this in the Render dashboard (your PAT)
+      - key: GITHUB_REPO
+        value: afeniabiodun12-ship-it/Scholarreach2.0
+      - key: API_KEY
+        sync: false          # invent any random string and set it here
+      - key: PYTHON_VERSION
+        value: "3.12.0"
