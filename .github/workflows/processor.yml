@@ -1,0 +1,67 @@
+name: Scholarreach Processor
+
+on:
+  schedule:
+    # Every 3 hours → overlapping coverage with 6h max job runtime
+    - cron: "0 */3 * * *"
+  workflow_dispatch:
+    inputs:
+      max_hours:
+        description: "Max runtime hours for this run (default 5.5)"
+        required: false
+        default: "5.5"
+  repository_dispatch:
+    types: [enqueue, process]
+
+# Prevent concurrent runs from fighting too hard (still allow overlap via schedule)
+concurrency:
+  group: scholarreach-processor
+  cancel-in-progress: false
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # hard limit 6h
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run processor loop
+        env:
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+          MONGODB_DB: ${{ secrets.MONGODB_DB || 'scholarreach' }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT || github.token }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          MAX_H="${{ github.event.inputs.max_hours || '5.5' }}"
+          MAX_S=$(python -c "print(int(float('$MAX_H') * 3600))")
+          echo "Starting Scholarreach processor (max ${MAX_S}s)..."
+          python -c "
+          from src.processor import run_loop
+          run_loop(max_runtime_seconds=$MAX_S)
+          "
+
+      - name: Queue status summary
+        if: always()
+        env:
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+          MONGODB_DB: ${{ secrets.MONGODB_DB || 'scholarreach' }}
+        run: |
+          python -c "
+          from src import db
+          try:
+              print('Queue status:', db.count_by_status())
+          except Exception as e:
+              print('Could not fetch status:', e)
+          "
