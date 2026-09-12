@@ -25,9 +25,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 5 parallel workers. Each independently claims jobs from MongoDB.
-        # Atomic claim prevents any two workers from taking the same job.
-        worker: [1, 2, 3, 4, 5]
+        # Maximum parallel workers on GitHub Free plan (20 concurrent jobs).
+        # Each worker independently claims jobs from MongoDB via atomic claim.
+        # When runs overlap (every 3h), effective capacity can reach ~40.
+        worker: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
