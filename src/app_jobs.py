@@ -40,17 +40,25 @@ def extracted_emails():
 
 def claim_next_app_job(worker_id: str) -> Optional[Dict[str, Any]]:
     """
-    Atomically claim the next queued ExtractionJob that is meant for
-    GitHub Actions (or any queued job after the migration).
+    Atomically claim the next ExtractionJob from the UI.
+
+    Accepts:
+    - status=queued (any runner, including missing runner after partial deploys)
+    - status=running + runner=github-actions that went stale
+    Never claims old browser-only jobs that are actively heartbeating.
     """
     now = datetime.now(timezone.utc)
     stale_before = now - timedelta(minutes=CLAIM_TIMEOUT_MINUTES)
 
-    # Prefer explicit github-actions queued jobs
+    # 1) Any queued job (github-actions or unset runner after migration)
     job = extraction_jobs().find_one_and_update(
         {
             "status": "queued",
-            "runner": "github-actions",
+            "$or": [
+                {"runner": "github-actions"},
+                {"runner": None},
+                {"runner": {"$exists": False}},
+            ],
         },
         {
             "$set": {
@@ -70,12 +78,16 @@ def claim_next_app_job(worker_id: str) -> Optional[Dict[str, Any]]:
     if job:
         return job
 
-    # Also reclaim stale running github-actions jobs
+    # 2) Reclaim stale running github-actions jobs (worker died / timed out)
     job = extraction_jobs().find_one_and_update(
         {
             "status": "running",
             "runner": "github-actions",
-            "lastHeartbeatAt": {"$lt": stale_before},
+            "$or": [
+                {"lastHeartbeatAt": {"$lt": stale_before}},
+                {"lastHeartbeatAt": None},
+                {"lastHeartbeatAt": {"$exists": False}},
+            ],
         },
         {
             "$set": {

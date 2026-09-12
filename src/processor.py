@@ -210,67 +210,31 @@ def process_extract(job: dict) -> dict:
 
 def run_once(worker_id: str) -> bool:
     """
-    Prefer UI ExtractionJobs. Fall back to internal queue.
-    Returns True if any work was done.
+    ONLY process UI ExtractionJobs (from ScholarReach web app).
+    Internal ijetrm/ijddt seed jobs are disabled — they were confusing the queue.
     """
-    # 1) App / UI jobs (primary path)
     app_job = app_jobs.claim_next_app_job(worker_id)
-    if app_job:
-        logger.info(
-            "Claimed UI ExtractionJob %s journal=%s target=%s user=%s",
-            app_job["_id"],
-            app_job.get("journal"),
-            app_job.get("target"),
-            app_job.get("userId"),
-        )
-        try:
-            process_app_extraction_job(app_job, worker_id)
-        except Exception as e:
-            logger.exception("App job %s failed: %s", app_job["_id"], e)
-            app_jobs.complete_app_job(
-                app_job["_id"],
-                success=False,
-                stage=f"Failed: {str(e)[:120]}",
-            )
-        return True
-
-    # 2) Legacy internal jobs collection
-    job = db.claim_next_job(worker_id)
-    if not job:
+    if not app_job:
         return False
 
-    jid = job["_id"]
-    jtype = job.get("type")
-    logger.info("Claimed internal job %s type=%s url=%s", jid, jtype, job.get("url"))
-
+    logger.info(
+        "Claimed UI ExtractionJob %s journal=%s target=%s status=%s user=%s",
+        app_job["_id"],
+        app_job.get("journal"),
+        app_job.get("target"),
+        app_job.get("status"),
+        app_job.get("userId"),
+    )
     try:
-        if jtype == "discover":
-            result = process_discover(job)
-        elif jtype == "extract":
-            result = process_extract(job)
-        else:
-            raise ValueError(f"Unknown job type: {jtype}")
-        db.complete_job(jid, result=result)
-        logger.info("Completed internal job %s", jid)
-        return True
+        process_app_extraction_job(app_job, worker_id)
     except Exception as e:
-        logger.exception("Internal job %s failed: %s", jid, e)
-        if job.get("attempts", 1) >= MAX_ATTEMPTS:
-            db.complete_job(jid, error=str(e))
-        else:
-            db.jobs_col().update_one(
-                {"_id": jid},
-                {
-                    "$set": {
-                        "status": "pending",
-                        "error": str(e),
-                        "updated_at": datetime.now(timezone.utc),
-                        "claimed_by": None,
-                        "claimed_at": None,
-                    }
-                },
-            )
-        return True
+        logger.exception("App job %s failed: %s", app_job["_id"], e)
+        app_jobs.complete_app_job(
+            app_job["_id"],
+            success=False,
+            stage=f"Failed: {str(e)[:120]}",
+        )
+    return True
 
 
 def run_loop(max_runtime_seconds: int = 5 * 3600 + 1800, idle_sleep: int = 3):
