@@ -1,0 +1,49 @@
+name: Enqueue Job
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_type:
+        description: "Job type"
+        required: true
+        default: "discover"
+        type: choice
+        options:
+          - discover
+          - extract
+      url:
+        description: "URL of the journal issue page or PDF"
+        required: true
+        type: string
+
+jobs:
+  enqueue:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install pymongo python-dotenv
+
+      - name: Enqueue the job
+        env:
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+          MONGODB_DB: scholarreach
+        run: |
+          python -c "
+          import sys
+          sys.path.insert(0, '.')
+          from src import db
+          job = db.enqueue_job(
+              job_type='${{ github.event.inputs.job_type }}',
+              url='${{ github.event.inputs.url }}',
+              priority=2
+          )
+          print(f'Enqueued: {job[\"_id\"]} status={job[\"status\"]}')
+          print('Current queue:', db.count_by_status())
+          "
