@@ -107,7 +107,7 @@ def extract_title_and_emails(pdf_bytes: bytes) -> Tuple[Optional[str], List[str]
                 title = t
 
         # first 3 pages text is usually enough for title + corresponding author
-        for i, page in enumerate(reader.pages[:4]):
+        for i, page in enumerate(reader.pages[:2]):
             try:
                 txt = page.extract_text() or ""
                 full_text_parts.append(txt)
@@ -135,7 +135,7 @@ def extract_title_and_emails(pdf_bytes: bytes) -> Tuple[Optional[str], List[str]
                     if len(top_line) > 15:
                         title = top_line[:300].strip()
 
-            for page in pdf.pages[:4]:
+            for page in pdf.pages[:2]:
                 try:
                     txt = page.extract_text() or ""
                     if txt:

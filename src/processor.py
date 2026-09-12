@@ -10,6 +10,7 @@ import logging
 import os
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 from src import db
@@ -113,45 +114,64 @@ def process_app_extraction_job(job: dict, worker_id: str) -> None:
     papers_done = 0
     errors = 0
 
-    for idx, pdf_url in enumerate(pdf_urls):
-        # Stop if we already hit the user's target
-        if emails_total >= target:
-            break
+    # Parallel PDF extraction inside this worker (biggest speed win).
+    # 6 concurrent downloads per worker × up to 20 workers ≈ high throughput,
+    # while still being somewhat polite to a single journal host.
+    PARALLEL = 6
+    total_pdfs = len(pdf_urls)
+    # Cap work to ~2× target papers as a safety bound
+    work_list = pdf_urls[: max(target * 3, 50)]
 
+    def _one(pdf_url: str):
         try:
-            app_jobs.update_job_progress(
-                job_id,
-                stage=f"Extracting paper {idx+1}/{len(pdf_urls)}…",
-                current_url=pdf_url,
-                progress=min(95, 20 + int(70 * (idx + 1) / max(len(pdf_urls), 1))),
-                papers_processed=papers_done,
-                emails_collected=emails_total,
-            )
-
             result = process_pdf_url(pdf_url)
-            title = result.get("title") or ""
-            emails = result.get("emails") or []
+            return pdf_url, result, None
+        except Exception as e:
+            return pdf_url, None, e
 
+    with ThreadPoolExecutor(max_workers=PARALLEL) as pool:
+        futures = {pool.submit(_one, u): u for u in work_list}
+        done_count = 0
+        for fut in as_completed(futures):
+            if emails_total >= target:
+                # Cancel remaining work
+                for f in futures:
+                    f.cancel()
+                break
+
+            pdf_url, result, err = fut.result()
+            done_count += 1
+
+            if err is not None:
+                errors += 1
+                if errors <= 5 or errors % 20 == 0:
+                    logger.warning("Extract failed %s: %s", pdf_url, err)
+                continue
+
+            title = (result or {}).get("title") or ""
+            emails = (result or {}).get("emails") or []
             added = app_jobs.push_emails_for_job(job, emails, paper_url=pdf_url, title=title)
             emails_total += added
             papers_done += 1
 
-            preview = ", ".join(emails[:3]) if emails else "(no emails)"
-            app_jobs.update_job_progress(
-                job_id,
-                batch_preview=preview,
-                emails_collected=emails_total,
-                papers_processed=papers_done,
-            )
-            logger.info(
-                "Job %s paper %s → +%d emails (total %d) title=%s",
-                job_id, pdf_url[-40:], added, emails_total, (title or "")[:60],
-            )
-        except Exception as e:
-            errors += 1
-            logger.warning("Extract failed %s: %s", pdf_url, e)
-            app_jobs.update_job_progress(job_id, error_message=str(e)[:200])
-            continue
+            # Progress write every few papers (less Mongo overhead = faster)
+            if papers_done % 3 == 0 or added > 0:
+                preview = ", ".join(emails[:3]) if emails else "(no emails)"
+                app_jobs.update_job_progress(
+                    job_id,
+                    stage=f"Extracting paper {papers_done}/{min(total_pdfs, len(work_list))}…",
+                    current_url=pdf_url,
+                    progress=min(95, 20 + int(70 * papers_done / max(min(total_pdfs, len(work_list)), 1))),
+                    papers_processed=papers_done,
+                    emails_collected=emails_total,
+                    batch_preview=preview,
+                )
+
+            if added:
+                logger.info(
+                    "Job %s paper …%s → +%d emails (total %d)",
+                    job_id, pdf_url[-40:], added, emails_total,
+                )
 
     # Final status
     final_stage = f"Done — {emails_total} emails from {papers_done} papers"
