@@ -64,17 +64,29 @@ def extract_emails_from_text(text: str) -> List[str]:
 
 
 def download_pdf(url: str) -> bytes:
-    headers = {"User-Agent": USER_AGENT, "Accept": "application/pdf,*/*"}
-    resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT, stream=True)
-    resp.raise_for_status()
-    content_type = resp.headers.get("Content-Type", "").lower()
-    if "pdf" not in content_type and not url.lower().endswith(".pdf"):
-        # still try if it looks like a PDF by magic
-        pass
-    data = resp.content
-    if not data.startswith(b"%PDF"):
-        raise ValueError(f"Downloaded content is not a PDF (url={url})")
-    return data
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/pdf,application/octet-stream,*/*",
+        "Connection": "close",
+    }
+    last_err = None
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT, stream=True, allow_redirects=True)
+            resp.raise_for_status()
+            data = resp.content
+            if data.startswith(b"%PDF"):
+                return data
+            # Some OJS servers return HTML error pages on rate-limit
+            if b"%PDF" in data[:2000]:
+                idx = data.find(b"%PDF")
+                return data[idx:]
+            raise ValueError(f"Downloaded content is not a PDF (url={url}, ctype={resp.headers.get('Content-Type')}, len={len(data)})")
+        except Exception as e:
+            last_err = e
+            import time
+            time.sleep(min(15, 2 ** attempt))
+    raise last_err  # type: ignore
 
 
 def extract_title_and_emails(pdf_bytes: bytes) -> Tuple[Optional[str], List[str]]:
@@ -159,13 +171,41 @@ def extract_title_and_emails(pdf_bytes: bytes) -> Tuple[Optional[str], List[str]
 
 
 def process_pdf_url(pdf_url: str) -> dict:
-    """High-level: download + extract. Returns structured result."""
-    data = download_pdf(pdf_url)
-    title, emails = extract_title_and_emails(data)
-    return {
-        "pdf_url": pdf_url,
-        "title": title,
-        "emails": emails,
-        "email_count": len(emails),
-        "source_domain": urlparse(pdf_url).netloc,
-    }
+    """High-level: download + extract. Returns structured result.
+
+    For OJS article/view URLs, tries article/download variants automatically.
+    """
+    candidates = [pdf_url]
+    # OJS view → download variants
+    import re
+    m = re.search(r"(article/view/)(\d+)(?:/(\d+))?", pdf_url, re.I)
+    if m:
+        base = pdf_url[: m.start(1)]
+        aid = m.group(2)
+        gid = m.group(3)
+        candidates = []
+        if gid:
+            candidates.append(f"{base}article/download/{aid}/{gid}")
+        candidates.append(f"{base}article/download/{aid}")
+        candidates.append(f"{base}article/download/{aid}/pdf")
+        if pdf_url not in candidates:
+            candidates.append(pdf_url)
+    elif "article/download/" in pdf_url and not pdf_url.rstrip("/").endswith("pdf"):
+        candidates = [pdf_url, pdf_url.rstrip("/") + "/pdf"]
+
+    last_err = None
+    for cand in candidates:
+        try:
+            data = download_pdf(cand)
+            title, emails = extract_title_and_emails(data)
+            return {
+                "pdf_url": cand,
+                "title": title,
+                "emails": emails,
+                "email_count": len(emails),
+                "source_domain": urlparse(cand).netloc,
+            }
+        except Exception as e:
+            last_err = e
+            continue
+    raise last_err  # type: ignore

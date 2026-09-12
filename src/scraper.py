@@ -36,17 +36,56 @@ def _session() -> requests.Session:
             "User-Agent": USER_AGENT,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
+            "Connection": "close",  # avoid sticky broken keep-alives on flaky hosts
         }
     )
+    # Limit pool size so 20 workers don't stampede one origin
+    adapter = requests.adapters.HTTPAdapter(pool_connections=2, pool_maxsize=2, max_retries=0)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
     return s
 
 
-def _get(url: str, session: Optional[requests.Session] = None) -> str:
+def _get(url: str, session: Optional[requests.Session] = None, retries: int = 3) -> str:
+    """Fetch with retries + exponential backoff. Raises on final failure."""
     sess = session or _session()
-    resp = sess.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-    resp.raise_for_status()
-    time.sleep(REQUEST_SLEEP)
-    return resp.text
+    last_err = None
+    for attempt in range(retries):
+        try:
+            resp = sess.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+            resp.raise_for_status()
+            time.sleep(REQUEST_SLEEP)
+            return resp.text
+        except Exception as e:
+            last_err = e
+            wait = min(20, (2 ** attempt) + 0.5)
+            logger.warning("Fetch attempt %d/%d failed %s: %s — retry in %.1fs", attempt + 1, retries, url, e, wait)
+            time.sleep(wait)
+    raise last_err  # type: ignore
+
+
+def ojs_download_candidates(article_view_url: str) -> List[str]:
+    """
+    OJS: /article/view/1234  →  try /article/download/1234 and /article/download/1234/XXXX
+    Many journals (including cspub-ijcisim) serve PDFs this way without needing the HTML page.
+    """
+    m = re.search(r"(article/view/)(\d+)(?:/(\d+))?", article_view_url, re.I)
+    if not m:
+        return []
+    base = article_view_url[: m.start(1)]
+    article_id = m.group(2)
+    galley_id = m.group(3)
+    out = [
+        f"{base}article/download/{article_id}",
+        f"{base}article/view/{article_id}",
+    ]
+    if galley_id:
+        out.insert(0, f"{base}article/download/{article_id}/{galley_id}")
+        out.insert(1, f"{base}article/download/{article_id}/{galley_id}/pdf")
+    else:
+        # common second-path pattern when galley id is unknown
+        out.append(f"{base}article/download/{article_id}/pdf")
+    return out
 
 
 def _origin(url: str) -> str:
@@ -341,7 +380,24 @@ def generic_discover(
                             "page_url": url,
                         }
                     )
-            elif kind in ("listing", "article") and depth < max_depth:
+            elif kind == "article":
+                # OJS: synthesize download URLs so we don't need to open every article HTML page
+                for cand in ojs_download_candidates(href):
+                    if "download" in cand and cand not in seen_pdfs:
+                        seen_pdfs.add(cand)
+                        pdfs.append(
+                            {
+                                "title": link.get("text") or None,
+                                "authors": None,
+                                "pdf_url": cand,
+                                "doi": None,
+                                "source": "ojs_synth",
+                                "page_url": href,
+                            }
+                        )
+                if depth < max_depth and href not in visited:
+                    queue.append((href, depth + 1))
+            elif kind == "listing" and depth < max_depth:
                 if href not in visited:
                     queue.append((href, depth + 1))
 
@@ -413,16 +469,35 @@ def discover_from_seeds(
                     "page_url": u,
                 }
             )
-        else:
-            # Treat as article page seed
-            try:
-                found = generic_discover([u], max_pages=5, max_depth=1, max_pdfs=20)
-                for p in found:
-                    if p["pdf_url"] not in seen:
-                        seen.add(p["pdf_url"])
-                        results.append(p)
-            except Exception as e:
-                logger.warning("Sample paper crawl failed %s: %s", u, e)
+            continue
+
+        # OJS article/view → try direct download URLs first (avoids flaky HTML fetches)
+        ojs_urls = ojs_download_candidates(u)
+        if ojs_urls:
+            for cand in ojs_urls:
+                if cand not in seen and "download" in cand:
+                    seen.add(cand)
+                    results.append(
+                        {
+                            "title": None,
+                            "authors": None,
+                            "pdf_url": cand,
+                            "doi": None,
+                            "source": "ojs_download",
+                            "page_url": u,
+                        }
+                    )
+            continue
+
+        # Non-OJS article page: light crawl
+        try:
+            found = generic_discover([u], max_pages=3, max_depth=1, max_pdfs=10)
+            for p in found:
+                if p["pdf_url"] not in seen:
+                    seen.add(p["pdf_url"])
+                    results.append(p)
+        except Exception as e:
+            logger.warning("Sample paper crawl failed %s: %s", u, e)
 
     if listing_urls:
         crawled = generic_discover(listing_urls)
