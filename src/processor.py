@@ -1,5 +1,10 @@
 """
-Core job processor used by GitHub Actions (and optionally locally).
+Core job processor used by GitHub Actions.
+
+Priority:
+1. Claim and process ExtractionJob documents created by the ScholarReach web UI
+   (live progress written back so the user sees results in real time).
+2. Fall back to the internal jobs collection (legacy / seed jobs).
 """
 import logging
 import os
@@ -8,6 +13,7 @@ import uuid
 from datetime import datetime, timezone
 
 from src import db
+from src import app_jobs
 from src.scraper import discover_papers
 from src.extractor import process_pdf_url
 from src.config import MAX_ATTEMPTS
@@ -17,6 +23,130 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("scholarreach.processor")
+
+
+def process_app_extraction_job(job: dict, worker_id: str) -> None:
+    """
+    Full pipeline for a UI-created ExtractionJob:
+    - Resolve seed / listing URLs for the journal
+    - Discover PDF links
+    - Download + extract title/emails
+    - Push emails into jobemails / extractedemails
+    - Continuously update progress/stage so the UI polls live data
+    """
+    job_id = job["_id"]
+    journal = job.get("journal") or "ijddt"
+    target = int(job.get("target") or 100)
+    user_id = job.get("userId")
+
+    app_jobs.update_job_progress(
+        job_id,
+        stage=f"Discovering papers for {journal}…",
+        progress=2,
+        status="running",
+    )
+
+    seeds = app_jobs.get_journal_seed_urls(journal, user_id)
+    listing_urls = seeds.get("listingUrls") or []
+    pdf_urls = list(seeds.get("pdfUrls") or [])
+    sample_urls = seeds.get("samplePaperUrls") or []
+
+    # Discover from listing pages
+    seen = set(pdf_urls)
+    for i, listing in enumerate(listing_urls):
+        try:
+            app_jobs.update_job_progress(
+                job_id,
+                stage=f"Scanning listing {i+1}/{len(listing_urls)}…",
+                current_url=listing,
+                progress=min(15, 3 + i * 2),
+            )
+            papers = discover_papers(listing)
+            for p in papers:
+                u = p.get("pdf_url")
+                if u and u not in seen:
+                    seen.add(u)
+                    pdf_urls.append(u)
+        except Exception as e:
+            logger.warning("Discover failed for %s: %s", listing, e)
+
+    # Also include any sample paper URLs as PDFs if they look like PDFs
+    for u in sample_urls:
+        if u and u.lower().endswith(".pdf") and u not in seen:
+            seen.add(u)
+            pdf_urls.append(u)
+
+    if not pdf_urls:
+        app_jobs.complete_app_job(
+            job_id,
+            success=False,
+            stage="No PDF links found for this journal",
+        )
+        return
+
+    app_jobs.update_job_progress(
+        job_id,
+        stage=f"Found {len(pdf_urls)} PDFs — extracting emails…",
+        progress=20,
+        papers_processed=0,
+    )
+
+    emails_total = 0
+    papers_done = 0
+    errors = 0
+
+    for idx, pdf_url in enumerate(pdf_urls):
+        # Stop if we already hit the user's target
+        if emails_total >= target:
+            break
+
+        try:
+            app_jobs.update_job_progress(
+                job_id,
+                stage=f"Extracting paper {idx+1}/{len(pdf_urls)}…",
+                current_url=pdf_url,
+                progress=min(95, 20 + int(70 * (idx + 1) / max(len(pdf_urls), 1))),
+                papers_processed=papers_done,
+                emails_collected=emails_total,
+            )
+
+            result = process_pdf_url(pdf_url)
+            title = result.get("title") or ""
+            emails = result.get("emails") or []
+
+            added = app_jobs.push_emails_for_job(job, emails, paper_url=pdf_url, title=title)
+            emails_total += added
+            papers_done += 1
+
+            preview = ", ".join(emails[:3]) if emails else "(no emails)"
+            app_jobs.update_job_progress(
+                job_id,
+                batch_preview=preview,
+                emails_collected=emails_total,
+                papers_processed=papers_done,
+            )
+            logger.info(
+                "Job %s paper %s → +%d emails (total %d) title=%s",
+                job_id, pdf_url[-40:], added, emails_total, (title or "")[:60],
+            )
+        except Exception as e:
+            errors += 1
+            logger.warning("Extract failed %s: %s", pdf_url, e)
+            app_jobs.update_job_progress(job_id, error_message=str(e)[:200])
+            continue
+
+    # Final status
+    final_stage = f"Done — {emails_total} emails from {papers_done} papers"
+    if emails_total == 0:
+        final_stage = f"Finished — no emails found ({papers_done} papers, {errors} errors)"
+    app_jobs.complete_app_job(job_id, success=True, stage=final_stage)
+    app_jobs.update_job_progress(
+        job_id,
+        progress=100,
+        emails_collected=emails_total,
+        papers_processed=papers_done,
+    )
+    logger.info("Completed app job %s → %s", job_id, final_stage)
 
 
 def process_discover(job: dict) -> dict:
@@ -50,28 +180,50 @@ def process_discover(job: dict) -> dict:
 def process_extract(job: dict) -> dict:
     pdf_url = job["url"]
     result = process_pdf_url(pdf_url)
-    # Enrich with discovery hints if present
     meta = job.get("meta") or {}
     if not result.get("title") and meta.get("title_hint"):
         result["title"] = meta["title_hint"]
     result["source_page"] = meta.get("source_page")
     result["doi"] = meta.get("doi")
     result["job_id"] = str(job["_id"])
-
     db.save_result(result)
     return result
 
 
 def run_once(worker_id: str) -> bool:
-    """Claim and process a single job. Returns True if a job was processed."""
+    """
+    Prefer UI ExtractionJobs. Fall back to internal queue.
+    Returns True if any work was done.
+    """
+    # 1) App / UI jobs (primary path)
+    app_job = app_jobs.claim_next_app_job(worker_id)
+    if app_job:
+        logger.info(
+            "Claimed UI ExtractionJob %s journal=%s target=%s user=%s",
+            app_job["_id"],
+            app_job.get("journal"),
+            app_job.get("target"),
+            app_job.get("userId"),
+        )
+        try:
+            process_app_extraction_job(app_job, worker_id)
+        except Exception as e:
+            logger.exception("App job %s failed: %s", app_job["_id"], e)
+            app_jobs.complete_app_job(
+                app_job["_id"],
+                success=False,
+                stage=f"Failed: {str(e)[:120]}",
+            )
+        return True
+
+    # 2) Legacy internal jobs collection
     job = db.claim_next_job(worker_id)
     if not job:
-        logger.info("No pending jobs")
         return False
 
     jid = job["_id"]
     jtype = job.get("type")
-    logger.info("Claimed job %s type=%s url=%s (attempt %s)", jid, jtype, job["url"], job.get("attempts"))
+    logger.info("Claimed internal job %s type=%s url=%s", jid, jtype, job.get("url"))
 
     try:
         if jtype == "discover":
@@ -81,15 +233,13 @@ def run_once(worker_id: str) -> bool:
         else:
             raise ValueError(f"Unknown job type: {jtype}")
         db.complete_job(jid, result=result)
-        logger.info("Completed job %s → %s", jid, {k: result.get(k) for k in ("title", "emails", "discovered", "enqueued_extract") if k in result})
+        logger.info("Completed internal job %s", jid)
         return True
     except Exception as e:
-        logger.exception("Job %s failed: %s", jid, e)
-        # If max attempts reached it will stay failed; otherwise next claim can retry
+        logger.exception("Internal job %s failed: %s", jid, e)
         if job.get("attempts", 1) >= MAX_ATTEMPTS:
             db.complete_job(jid, error=str(e))
         else:
-            # put back to pending so another worker (or later run) can retry
             db.jobs_col().update_one(
                 {"_id": jid},
                 {
@@ -102,19 +252,22 @@ def run_once(worker_id: str) -> bool:
                     }
                 },
             )
-        return True  # we did work (even if failed)
+        return True
 
 
 def run_loop(max_runtime_seconds: int = 5 * 3600 + 1800, idle_sleep: int = 3):
     """
-    Main loop for a GitHub Actions job.
-
-    - Runs for the FULL max_runtime_seconds (never exits early just because queue is empty).
-    - Polls every `idle_sleep` seconds (default 3s) when no work is available.
-    - Multiple parallel workers can safely share the same queue thanks to atomic claiming.
+    Runs for the FULL max_runtime_seconds.
+    Polls every idle_sleep seconds when the queue is empty.
+    Never exits early just because there are no jobs.
     """
     worker_id = f"gha-{os.getenv('GITHUB_RUN_ID', 'local')}-{os.getenv('GITHUB_JOB', 'job')}-{uuid.uuid4().hex[:6]}"
-    logger.info("Worker %s starting (max runtime %ss, idle poll %ss)", worker_id, max_runtime_seconds, idle_sleep)
+    logger.info(
+        "Worker %s starting (max runtime %ss, idle poll %ss)",
+        worker_id,
+        max_runtime_seconds,
+        idle_sleep,
+    )
 
     db.ensure_indexes()
     start = time.time()
@@ -124,26 +277,35 @@ def run_loop(max_runtime_seconds: int = 5 * 3600 + 1800, idle_sleep: int = 3):
     while True:
         elapsed = time.time() - start
         if elapsed >= max_runtime_seconds:
-            logger.info("Reached max runtime (%.0fs). Processed %d jobs. Exiting.", elapsed, processed)
+            logger.info(
+                "Reached max runtime (%.0fs). Processed %d jobs. Exiting.",
+                elapsed,
+                processed,
+            )
             break
 
         had_work = run_once(worker_id)
         if had_work:
             processed += 1
         else:
-            # No job available right now — wait a short time then check again.
-            # We NEVER exit early; we stay alive for the full runtime.
             time.sleep(idle_sleep)
 
-        # Log queue stats every ~5 minutes so we can see activity
         if elapsed - last_status_log > 300:
             try:
                 stats = db.count_by_status()
-                logger.info("Queue status (%.0fs elapsed, %d processed): %s", elapsed, processed, stats)
+                logger.info(
+                    "Internal queue (%.0fs, %d done): %s",
+                    elapsed,
+                    processed,
+                    stats,
+                )
             except Exception:
                 pass
             last_status_log = elapsed
 
-    stats = db.count_by_status()
-    logger.info("Final queue stats: %s | Total processed this worker: %d", stats, processed)
+    try:
+        stats = db.count_by_status()
+        logger.info("Final internal queue: %s | processed=%d", stats, processed)
+    except Exception:
+        pass
     return processed
