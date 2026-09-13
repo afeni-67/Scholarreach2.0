@@ -198,6 +198,18 @@ def push_emails_for_job(job: Dict, emails: List[str], paper_url: str = "", title
         # Refresh count from source of truth
         total = job_emails().count_documents({"jobId": job_id})
         update_job_progress(job_id, emails_collected=total)
+        # Charge quota by REAL emails only (WeeklyUsage in app DB)
+        try:
+            from datetime import datetime as _dt
+            week = _dt.utcnow().strftime("%Y-%m")
+            app_db()["weeklyusages"].update_one(
+                {"userId": user_id, "week": week},
+                {"$inc": {"emailsUsed": added}, "$setOnInsert": {"userId": user_id, "week": week}},
+                upsert=True,
+            )
+        except Exception as e:
+            logger = __import__("logging").getLogger(__name__)
+            logger.warning("quota increment failed: %s", e)
     return added
 
 
