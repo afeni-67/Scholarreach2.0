@@ -58,6 +58,7 @@ def claim_next_app_job(worker_id: str) -> Optional[Dict[str, Any]]:
                 {"runner": "github-actions"},
                 {"runner": None},
                 {"runner": {"$exists": False}},
+                {"runner": ""},
             ],
         },
         {

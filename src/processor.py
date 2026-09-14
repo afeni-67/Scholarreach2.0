@@ -329,17 +329,15 @@ def run_loop(max_runtime_seconds: int = 5 * 3600 + 1800, idle_sleep: int = 3):
         else:
             time.sleep(idle_sleep)
 
-        if elapsed - last_status_log > 300:
-            try:
-                stats = db.count_by_status()
-                logger.info(
-                    "Internal queue (%.0fs, %d done): %s",
-                    elapsed,
-                    processed,
-                    stats,
-                )
-            except Exception:
-                pass
+        if elapsed - last_status_log > 60:
+            remaining = max_runtime_seconds - elapsed
+            logger.info(
+                "Listening for jobs… elapsed=%.0fs remaining=%.0fs ui_jobs_done=%d (poll every %ss)",
+                elapsed,
+                remaining,
+                processed,
+                idle_sleep,
+            )
             last_status_log = elapsed
 
     try:
