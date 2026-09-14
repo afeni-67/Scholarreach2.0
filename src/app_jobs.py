@@ -257,11 +257,11 @@ def get_journal_seed_urls(journal: str, user_id) -> Dict[str, List[str]]:
     """
     Resolve listing / PDF seed URLs for a journal (built-in or custom).
     """
-    journal = (journal or "").lower().strip()
+    raw = (journal or "").strip()
+    journal = raw.lower()
     result = {"listingUrls": [], "pdfUrls": [], "samplePaperUrls": []}
 
     if journal in ("ijddt", "ijetrm"):
-        # Built-in: return known listing pages; scraper will expand.
         if journal == "ijetrm":
             result["listingUrls"] = [
                 "https://ijetrm.com/issue/?volume=current",
@@ -269,17 +269,78 @@ def get_journal_seed_urls(journal: str, user_id) -> Dict[str, List[str]]:
                 "https://ijetrm.com/issue/?volume=March~2026",
             ]
         else:
-            # IJDDT — workers will use generic discovery / known seeds
             result["listingUrls"] = ["https://ijddt.com/"]
         return result
 
-    # Custom user journal
-    if user_id:
-        uj = app_db()[USER_JOURNALS].find_one(
-            {"userId": user_id, "slug": journal, "status": "ready"}
-        )
-        if uj:
-            result["listingUrls"] = uj.get("listingUrls") or ([uj["seedUrl"]] if uj.get("seedUrl") else [])
-            result["pdfUrls"] = uj.get("pdfUrls") or []
-            result["samplePaperUrls"] = uj.get("samplePaperUrls") or []
+    # Direct URL pasted as journal id
+    if raw.startswith("http://") or raw.startswith("https://"):
+        result["listingUrls"] = [raw]
+        return result
+
+    coll = app_db()[USER_JOURNALS]
+
+    def _from_uj(uj):
+        if not uj:
+            return
+        listings = uj.get("listingUrls") or []
+        seed = uj.get("seedUrl")
+        if seed and seed not in listings:
+            listings = [seed] + list(listings)
+        result["listingUrls"] = listings
+        result["pdfUrls"] = uj.get("pdfUrls") or []
+        result["samplePaperUrls"] = uj.get("samplePaperUrls") or []
+
+    # Custom user journal — tolerate ObjectId / str userId and case variants
+    if user_id is not None:
+        uid_candidates = [user_id]
+        try:
+            from bson import ObjectId
+            if isinstance(user_id, str) and ObjectId.is_valid(user_id):
+                uid_candidates.append(ObjectId(user_id))
+            elif isinstance(user_id, ObjectId):
+                uid_candidates.append(str(user_id))
+        except Exception:
+            pass
+
+        for uid in uid_candidates:
+            uj = coll.find_one({"userId": uid, "slug": raw})
+            if not uj:
+                uj = coll.find_one({"userId": uid, "slug": journal})
+            if not uj:
+                # regex slug (ignore case)
+                uj = coll.find_one({"userId": uid, "slug": {"$regex": f"^{re.escape(raw)}$", "$options": "i"}})
+            if uj:
+                _from_uj(uj)
+                break
+
+    # Fallback: any journal with this slug (ready or not)
+    if not result["listingUrls"]:
+        uj = coll.find_one({"slug": raw}) or coll.find_one({"slug": journal})
+        if not uj:
+            uj = coll.find_one({"slug": {"$regex": f"^{re.escape(raw)}$", "$options": "i"}})
+        _from_uj(uj)
+
+    # Reconstruct from custom-* slug if still empty (e.g. custom-https-isjem-com-past-issues-xxx)
+    if not result["listingUrls"] and journal.startswith("custom-"):
+        body = journal[len("custom-") :]
+        # drop random suffix after last short token if present
+        parts = body.split("-")
+        # try https://host/path reconstruction
+        if len(parts) >= 2 and parts[0] in ("https", "http"):
+            scheme = parts[0]
+            # last segment is often random id (qgct) — drop if short
+            if parts[-1] and len(parts[-1]) <= 6 and parts[-1].isalnum():
+                parts = parts[:-1]
+            host = parts[1] if len(parts) > 1 else ""
+            path_parts = parts[2:]
+            path = "/" + "/".join(path_parts) if path_parts else "/"
+            if not path.endswith("/") and "issue" in path:
+                path += "/"
+            guess = f"{scheme}://{host}{path}"
+            if host:
+                result["listingUrls"] = [guess]
+                # common fix: isjem.com past-issues
+                if "isjem" in host and "past" in path:
+                    result["listingUrls"] = ["https://isjem.com/past-issues/"]
+
     return result

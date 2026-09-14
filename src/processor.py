@@ -48,9 +48,13 @@ def process_app_extraction_job(job: dict, worker_id: str) -> None:
     )
 
     seeds = app_jobs.get_journal_seed_urls(journal, user_id)
-    listing_urls = seeds.get("listingUrls") or []
+    listing_urls = list(seeds.get("listingUrls") or [])
     seed_pdfs = list(seeds.get("pdfUrls") or [])
-    sample_urls = seeds.get("samplePaperUrls") or []
+    sample_urls = list(seeds.get("samplePaperUrls") or [])
+    logger.info(
+        "Job %s seeds listing=%s pdfs=%d samples=%d",
+        job_id, listing_urls[:3], len(seed_pdfs), len(sample_urls),
+    )
 
     # Fallback built-in listing pages when no custom seeds exist
     if not listing_urls and not seed_pdfs and not sample_urls:
@@ -62,6 +66,8 @@ def process_app_extraction_job(job: dict, worker_id: str) -> None:
             ]
         elif journal == "ijddt":
             listing_urls = ["https://ijddt.com/"]
+        elif "isjem" in (journal or "").lower():
+            listing_urls = ["https://isjem.com/past-issues/"]
 
     app_jobs.update_job_progress(
         job_id,
