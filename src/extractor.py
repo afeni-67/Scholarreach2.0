@@ -69,23 +69,42 @@ def download_pdf(url: str) -> bytes:
         "Accept": "application/pdf,application/octet-stream,*/*",
         "Connection": "close",
     }
+    candidates = [url]
+    if "web.archive.org" not in url:
+        candidates.append(f"https://web.archive.org/web/2/{url}")
+
     last_err = None
-    for attempt in range(3):
-        try:
-            resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT, stream=True, allow_redirects=True)
-            resp.raise_for_status()
-            data = resp.content
-            if data.startswith(b"%PDF"):
-                return data
-            # Some OJS servers return HTML error pages on rate-limit
-            if b"%PDF" in data[:2000]:
-                idx = data.find(b"%PDF")
-                return data[idx:]
-            raise ValueError(f"Downloaded content is not a PDF (url={url}, ctype={resp.headers.get('Content-Type')}, len={len(data)})")
-        except Exception as e:
-            last_err = e
-            import time
-            time.sleep(min(15, 2 ** attempt))
+    for target in candidates:
+        for attempt in range(3):
+            try:
+                resp = requests.get(
+                    target,
+                    headers=headers,
+                    timeout=REQUEST_TIMEOUT + (20 if "web.archive.org" in target else 0),
+                    stream=True,
+                    allow_redirects=True,
+                )
+                # Cloudflare HTML challenge is not a PDF
+                if resp.status_code in (403, 503) and (
+                    "cloudflare" in (resp.headers.get("server") or "").lower()
+                    or "just a moment" in (resp.text or "")[:1500].lower()
+                ):
+                    last_err = RuntimeError(f"Cloudflare blocked PDF {target}")
+                    break
+                resp.raise_for_status()
+                data = resp.content
+                if data.startswith(b"%PDF"):
+                    return data
+                if b"%PDF" in data[:4000]:
+                    idx = data.find(b"%PDF")
+                    return data[idx:]
+                raise ValueError(
+                    f"Downloaded content is not a PDF (url={target}, ctype={resp.headers.get('Content-Type')}, len={len(data)})"
+                )
+            except Exception as e:
+                last_err = e
+                import time
+                time.sleep(min(12, 2 ** attempt))
     raise last_err  # type: ignore
 
 

@@ -46,21 +46,70 @@ def _session() -> requests.Session:
     return s
 
 
+def _is_cloudflare_block(resp: requests.Response) -> bool:
+    if resp.status_code in (403, 503):
+        body = (resp.text or "")[:2000].lower()
+        if "just a moment" in body or "cf-mitigated" in (resp.headers.get("cf-mitigated") or "").lower():
+            return True
+        if "cloudflare" in body and ("challenge" in body or "enable javascript" in body):
+            return True
+    return False
+
+
+def _wayback_url(url: str) -> str:
+    """Internet Archive snapshot proxy — bypasses Cloudflare for blocked OA journals."""
+    # Prefer most recent available capture
+    return f"https://web.archive.org/web/2/{url}"
+
+
+def _unwrap_wayback(url: str) -> str:
+    """Turn https://web.archive.org/web/2025id_/https://isjem.com/... into the original URL."""
+    if not url or "web.archive.org" not in url:
+        return url
+    m = re.search(r"web\.archive\.org/web/\d+(?:id_|if_|[a-z]*_)?/(https?://.+)$", url, re.I)
+    if m:
+        return m.group(1)
+    m = re.search(r"web\.archive\.org/web/\d+/(https?://.+)$", url, re.I)
+    if m:
+        return m.group(1)
+    return url
+
+
 def _get(url: str, session: Optional[requests.Session] = None, retries: int = 3) -> str:
-    """Fetch with retries + exponential backoff. Raises on final failure."""
+    """Fetch with retries, Cloudflare detection, and Wayback Machine fallback."""
     sess = session or _session()
     last_err = None
-    for attempt in range(retries):
-        try:
-            resp = sess.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-            resp.raise_for_status()
-            time.sleep(REQUEST_SLEEP)
-            return resp.text
-        except Exception as e:
-            last_err = e
-            wait = min(20, (2 ** attempt) + 0.5)
-            logger.warning("Fetch attempt %d/%d failed %s: %s — retry in %.1fs", attempt + 1, retries, url, e, wait)
-            time.sleep(wait)
+    candidates = [url]
+    # If already a wayback URL, don't nest
+    if "web.archive.org" not in url:
+        candidates.append(_wayback_url(url))
+
+    for target in candidates:
+        for attempt in range(retries):
+            try:
+                resp = sess.get(target, timeout=REQUEST_TIMEOUT + (15 if "web.archive.org" in target else 0), allow_redirects=True)
+                if _is_cloudflare_block(resp):
+                    logger.warning("Cloudflare block on %s — will try fallback", target)
+                    last_err = RuntimeError(f"Cloudflare blocked {target}")
+                    break  # try next candidate
+                resp.raise_for_status()
+                html = resp.text or ""
+                if "just a moment" in html[:1500].lower() and "enable javascript" in html[:2000].lower():
+                    logger.warning("CF challenge HTML on %s", target)
+                    last_err = RuntimeError(f"Cloudflare challenge {target}")
+                    break
+                # Strip wayback toolbar noise slightly
+                if "web.archive.org" in target:
+                    html = re.sub(r"<!--\s*BEGIN WAYBACK TOOLBAR INSERT[\s\S]*?END WAYBACK TOOLBAR INSERT\s*-->", "", html, flags=re.I)
+                time.sleep(REQUEST_SLEEP)
+                if target != url:
+                    logger.info("Fetched via Wayback: %s", url)
+                return html
+            except Exception as e:
+                last_err = e
+                wait = min(15, (2 ** attempt) + 0.5)
+                logger.warning("Fetch attempt %d/%d failed %s: %s — retry in %.1fs", attempt + 1, retries, target, e, wait)
+                time.sleep(wait)
     raise last_err  # type: ignore
 
 
@@ -167,6 +216,13 @@ def classify_link(url: str, text_hint: str = "") -> Optional[str]:
         if re.search(r"/cert/|certificate", u, re.I):
             return None
         return "pdf"
+    # WordPress Download Manager (ISJEM and similar)
+    if re.search(r"/download/[^?#]+", u, re.I) and re.search(r"wpdmdl=\d+", u, re.I):
+        return "pdf"
+    if re.search(r"wpdmdl=\d+", u, re.I):
+        return "pdf"
+    if re.search(r"/wp-content/uploads/.*\.pdf", u, re.I):
+        return "pdf"
 
     # OJS / download endpoints
     if re.search(r"article/download/|/download/\d+", u, re.I):
@@ -245,6 +301,15 @@ def classify_link(url: str, text_hint: str = "") -> Optional[str]:
         return "listing"
     if re.search(r"publications\.php", u, re.I):
         return "listing"
+    # ISJEM / WordPress issue archives
+    if re.search(r"/past-issues/?", u, re.I):
+        return "listing"
+    if re.search(r"/volume[-_]?\d+", u, re.I) or re.search(r"volume\d+issue\d+", u, re.I):
+        return "listing"
+    if re.search(r"/current-issue/?", u, re.I):
+        return "listing"
+    if re.search(r"/special-edition", u, re.I):
+        return "listing"
     if re.search(r"contents?\.htm", u, re.I) or re.search(r"toc\.htm", u, re.I):
         return "listing"
     if "issue" in t and ("view" in t or "archive" in t or "list" in t or re.search(r"\d", t)):
@@ -271,13 +336,23 @@ def extract_links_from_html(html: str, base_url: str) -> List[Dict[str, str]]:
 
     for a in soup.find_all("a", href=True):
         full = _resolve(a["href"], base_url)
+        if not full:
+            continue
+        full = _unwrap_wayback(full)
         if not full or full in seen:
             continue
         # Prefer same-site, but allow absolute PDF on CDNs
         kind = classify_link(full, a.get_text(" ", strip=True))
         if not kind:
             continue
-        if kind != "pdf" and not _same_site(full, origin):
+        if kind != "pdf" and not _same_site(full, origin) and not _same_site(full, _unwrap_wayback(base_url)):
+            # still allow volume/issue listings for known journal hosts
+            if kind == "listing" and re.search(r"volume|issue|past-issues|archive", full, re.I):
+                pass
+            else:
+                continue
+        # Skip template / certificate noise downloads
+        if kind == "pdf" and re.search(r"manuscript-template|sample-certificate|copyright-form|author.guideline", full, re.I):
             continue
         seen.add(full)
         out.append(
