@@ -2,8 +2,10 @@ name: Scholarreach Processor
 
 on:
   schedule:
-    # Every 3 hours → overlapping coverage with ~6h max runtime
-    - cron: "0 */3 * * *"
+    # Every 2 hours. With 10 workers per run, two waves fit under GitHub Free
+    # concurrent limit (20). Overlap is real: wave B starts while wave A still runs.
+    # Minute 17 avoids the top-of-hour Actions schedule pile-up that causes skips.
+    - cron: "17 */2 * * *"
   workflow_dispatch:
     inputs:
       max_hours:
@@ -13,7 +15,7 @@ on:
   repository_dispatch:
     types: [enqueue, process]
 
-# Allow overlapping runs from the schedule (do NOT cancel previous ones)
+# Never cancel an older wave when a newer one starts
 concurrency:
   group: scholarreach-processor-${{ github.run_id }}
   cancel-in-progress: false
@@ -21,14 +23,14 @@ concurrency:
 jobs:
   process:
     runs-on: ubuntu-latest
-    timeout-minutes: 360   # hard limit 6h
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
-        # Maximum parallel workers on GitHub Free plan (20 concurrent jobs).
-        # Each worker independently claims jobs from MongoDB via atomic claim.
-        # When runs overlap (every 3h), effective capacity can reach ~40.
-        worker: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+        # 10 workers × 2 overlapping runs = 20 = GitHub Free max concurrent jobs.
+        # Using 20 per run made the next scheduled wave sit queued (or get delayed)
+        # until the first wave finished — so you never saw a true second runner.
+        worker: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
