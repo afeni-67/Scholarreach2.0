@@ -24,9 +24,9 @@ from src.config import USER_AGENT, REQUEST_TIMEOUT, REQUEST_SLEEP
 
 logger = logging.getLogger(__name__)
 
-MAX_PAGES = 200
-MAX_DEPTH = 4
-MAX_PDFS = 800
+MAX_PAGES = 400
+MAX_DEPTH = 6
+MAX_PDFS = 2500
 
 def _seed_priority(url: str) -> int:
     """Lower = crawl first. Prefer current issue / concrete issue view over vague archives."""
@@ -40,6 +40,66 @@ def _seed_priority(url: str) -> int:
     if re.search(r"article/view/", u):
         return 3
     return 5
+
+
+
+def expand_ojs_archive_issues(html: str, base_url: str) -> Dict[str, List[str]]:
+    """
+    From an OJS archive / issue TOC page, collect:
+      - all issue/view/{id} links (each volume/issue)
+      - archive pagination (/issue/archive/2, ?page=2, Next)
+      - sequential issue ids between min..max seen (fills gaps without hardcoding)
+    This is how we walk the whole journal, not one page.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    origin = _origin(base_url)
+    issues: Set[str] = set()
+    archive_pages: Set[str] = set()
+    issue_ids: Set[int] = set()
+    base_prefix = None  # e.g. https://ijcr.info/index.php/journal/issue/view/
+
+    for a in soup.find_all("a", href=True):
+        full = _resolve(a["href"], base_url)
+        if not full or not _same_site(full, origin):
+            continue
+        full = full.split("#")[0]
+        m = re.search(r"(https?://[^\s]+/issue/view/)(\d+)/?$", full, re.I)
+        if m:
+            issues.add(m.group(0).rstrip("/"))
+            issue_ids.add(int(m.group(2)))
+            base_prefix = m.group(1)
+            continue
+        # OJS archive pagination: /issue/archive/2 or /issue/archive?page=2
+        if re.search(r"/issue/archive(/\d+)?/?$", full, re.I) or re.search(
+            r"/issue/archive/?\?[^\s]*page=", full, re.I
+        ):
+            archive_pages.add(full)
+            continue
+        text = (a.get_text(" ", strip=True) or "").lower()
+        rel = " ".join(a.get("rel") or []).lower()
+        if ("next" in rel or text in ("next", "›", "»", "older") or "next" in text) and "archive" in full:
+            archive_pages.add(full)
+
+    # Fill sequential gaps only within observed min..max (safe, not infinite guess)
+    if base_prefix and issue_ids:
+        lo, hi = min(issue_ids), max(issue_ids)
+        # Cap span so a weird page cannot explode to 100k ids
+        if hi - lo <= 500:
+            for i in range(lo, hi + 1):
+                issues.add(f"{base_prefix}{i}")
+
+    # Also enqueue archive/1..N if we saw archive/2 pattern
+    for ap in list(archive_pages):
+        m = re.search(r"(https?://[^\s]+/issue/archive)/(\d+)/?$", ap, re.I)
+        if m:
+            prefix, n = m.group(1), int(m.group(2))
+            for i in range(1, n + 3):  # a couple past last seen
+                archive_pages.add(f"{prefix}/{i}" if i > 1 else prefix)
+
+    return {
+        "issues": sorted(issues, key=lambda u: int(re.search(r"(\d+)$", u).group(1)) if re.search(r"(\d+)$", u) else 0),
+        "archive_pages": sorted(archive_pages),
+    }
 
 
 def probe_pdf_url(url: str, session: Optional[requests.Session] = None) -> bool:
@@ -635,6 +695,27 @@ def generic_discover(
             continue
 
         links = extract_links_from_html(html, url)
+
+        # --- Progressive issue/volume walk (OJS and similar) ---
+        # Archive pages list many Volume X / Issue Y → issue/view/{id}.
+        # Expand ALL issues + archive pagination so we do not stop at one TOC page.
+        if re.search(r"issue/archive|issue/current|issue/view/\d+|past-issues|/archive", url, re.I):
+            expanded = expand_ojs_archive_issues(html, url)
+            for iss in expanded["issues"]:
+                if iss not in visited:
+                    # Listings (issues) get depth+0 so article pages still have budget
+                    queue.append((iss, depth))
+            for ap in expanded["archive_pages"]:
+                if ap not in visited:
+                    queue.append((ap, depth))
+            if expanded["issues"] or expanded["archive_pages"]:
+                logger.info(
+                    "Issue-walk %s → %d issues, %d archive pages (queue=%d)",
+                    url[-60:],
+                    len(expanded["issues"]),
+                    len(expanded["archive_pages"]),
+                    len(queue),
+                )
 
         # Always pull PDF hrefs that actually appear on this page (article or listing).
         # Never invent /article/download/{id}/{galley} numbers.
