@@ -28,6 +28,43 @@ MAX_PAGES = 200
 MAX_DEPTH = 4
 MAX_PDFS = 800
 
+def _seed_priority(url: str) -> int:
+    """Lower = crawl first. Prefer current issue / concrete issue view over vague archives."""
+    u = (url or "").lower()
+    if re.search(r"issue/current|/current/?$", u):
+        return 0
+    if re.search(r"issue/view/\d+", u):
+        return 1
+    if re.search(r"issue/archive|past-issues|/archive", u):
+        return 2
+    if re.search(r"article/view/", u):
+        return 3
+    return 5
+
+
+def probe_pdf_url(url: str, session: Optional[requests.Session] = None) -> bool:
+    """
+    Lightweight liveness check before enqueue.
+    Treat 2xx/3xx as alive; 404/410 as dead. Network errors → assume alive (don't drop).
+    """
+    sess = session or _session()
+    try:
+        r = sess.head(url, timeout=12, allow_redirects=True)
+        if r.status_code in (405, 501, 403):
+            r = sess.get(url, timeout=12, allow_redirects=True, stream=True)
+            try:
+                next(r.iter_content(256), None)
+            except Exception:
+                pass
+            r.close()
+        if r.status_code in (404, 410):
+            return False
+        return r.status_code < 400
+    except Exception:
+        return True  # don't discard on flaky network
+
+
+
 def find_pagination_links(html: str, base_url: str) -> List[str]:
     """
     Smart pagination: collect next/prev and numbered page links from the current listing.
@@ -222,8 +259,10 @@ def paper_download_candidates(article_url: str) -> List[str]:
 
 def ojs_download_candidates(article_view_url: str) -> List[str]:
     """
-    OJS: /article/view/1234  →  try /article/download/1234 and /article/download/1234/XXXX
-    Many journals (including cspub-ijcisim) serve PDFs this way without needing the HTML page.
+    DEPRECATED — do not use in discovery.
+    Synthesizing download URLs caused ~94% 404 rates in live benchmarks.
+    Prefer extract_pdfs_from_article_page() on the real article HTML.
+    Kept only for emergency debugging.
     """
     m = re.search(r"(article/view/)(\d+)(?:/(\d+))?", article_view_url, re.I)
     if not m:
@@ -449,32 +488,63 @@ def extract_links_from_html(html: str, base_url: str) -> List[Dict[str, str]]:
 
 
 def extract_pdfs_from_article_page(html: str, base_url: str) -> List[str]:
-    """From an article HTML page, find the actual PDF link(s)."""
+    """
+    From an article HTML page, find PDF links that ACTUALLY appear on the page.
+    Never invent article/download/{id}/{galley} paths.
+    Priority: citation_pdf_url meta → explicit PDF anchors → OJS galley/download hrefs
+    → iframe/embed → buttons labeled PDF/Full Text that point at real hrefs.
+    """
     soup = BeautifulSoup(html, "lxml")
-    pdfs = []
+    pdfs: List[str] = []
     seen: Set[str] = set()
 
-    for meta in soup.find_all("meta", attrs={"name": re.compile(r"citation_pdf_url", re.I)}):
-        pdf = (meta.get("content") or "").strip()
-        if pdf and pdf not in seen:
-            seen.add(pdf)
-            pdfs.append(pdf)
+    def add(u: Optional[str]):
+        if not u or u in seen:
+            return
+        if re.search(r"certificate|/cert/|manuscript-template|copyright-form|author.?guideline", u, re.I):
+            return
+        seen.add(u)
+        pdfs.append(u)
 
+    # 1) High-confidence meta tags (IJETRM, many OA publishers)
+    for meta in soup.find_all("meta", attrs={"name": re.compile(r"citation_pdf_url", re.I)}):
+        add((meta.get("content") or "").strip())
+    for meta in soup.find_all("meta", attrs={"name": re.compile(r"citation_fulltext_html_url", re.I)}):
+        # not a PDF — skip
+        pass
+
+    # 2) Anchors: classify + text hints (PDF, Full Text, Download)
     for a in soup.find_all("a", href=True):
         full = _resolve(a["href"], base_url)
-        if not full or full in seen:
+        if not full:
             continue
-        if classify_link(full, a.get_text(" ", strip=True)) == "pdf":
-            seen.add(full)
-            pdfs.append(full)
+        text = a.get_text(" ", strip=True) or ""
+        kind = classify_link(full, text)
+        if kind == "pdf":
+            add(full)
+            continue
+        # OJS often labels the real galley link as "PDF" even if URL has no .pdf suffix
+        if re.search(r"article/download/|/download/\d+|bitstream|galley", full, re.I):
+            add(full)
+            continue
+        if re.search(r"^\s*(pdf|full\s*text|fulltext|download\s*pdf|view\s*pdf)\s*$", text, re.I):
+            if re.search(r"download|pdf|bitstream|galley|get|file", full, re.I):
+                add(full)
 
-    # iframe / embed src that look like PDFs
+    # 3) iframe / embed / object
     for tag in soup.find_all(["iframe", "embed", "object"]):
         src = tag.get("src") or tag.get("data")
         full = _resolve(src, base_url) if src else None
-        if full and full not in seen and re.search(r"\.pdf|download|bitstream", full, re.I):
-            seen.add(full)
-            pdfs.append(full)
+        if full and re.search(r"\.pdf|download|bitstream|galley", full, re.I):
+            add(full)
+
+    # 4) data-* attributes some themes use
+    for tag in soup.find_all(attrs={"data-pdf": True}):
+        add(_resolve(tag.get("data-pdf"), base_url))
+    for tag in soup.find_all(attrs={"data-url": True}):
+        u = tag.get("data-url") or ""
+        if re.search(r"pdf|download|bitstream", u, re.I):
+            add(_resolve(u, base_url))
 
     return pdfs
 
@@ -546,9 +616,10 @@ def generic_discover(
     seen_pdfs: Set[str] = set()
     pages_fetched = 0
 
-    for s in seed_urls:
-        if s:
-            queue.append((s, 0))
+    # Prefer current issue / issue/view seeds first (benchmark: better PDF yield)
+    ordered = sorted([s for s in seed_urls if s], key=_seed_priority)
+    for s in ordered:
+        queue.append((s, 0))
 
     while queue and pages_fetched < max_pages and len(pdfs) < max_pdfs:
         url, depth = queue.popleft()
@@ -571,6 +642,11 @@ def generic_discover(
         if page_kind in ("article", None) or any(l["kind"] == "pdf" for l in links):
             for pdf in extract_pdfs_from_article_page(html, url):
                 if pdf not in seen_pdfs:
+                    looks_synth = bool(re.search(r"article/download/\d+(/\d+)?(/pdf)?/?$", pdf, re.I))
+                    if looks_synth and not probe_pdf_url(pdf, session):
+                        logger.debug("Skip dead article PDF %s", pdf)
+                        seen_pdfs.add(pdf)
+                        continue
                     seen_pdfs.add(pdf)
                     pdfs.append(
                         {
@@ -588,17 +664,23 @@ def generic_discover(
             href = link["url"]
             if kind == "pdf":
                 if href not in seen_pdfs:
-                    seen_pdfs.add(href)
-                    pdfs.append(
-                        {
-                            "title": link.get("text") or None,
-                            "authors": None,
-                            "pdf_url": href,
-                            "doi": None,
-                            "source": "link",
-                            "page_url": url,
-                        }
-                    )
+                    # Probe guessed-looking download paths; skip confirmed 404s early
+                    looks_synth = bool(re.search(r"article/download/\d+(/\d+)?(/pdf)?/?$", href, re.I))
+                    if looks_synth and not probe_pdf_url(href, session):
+                        logger.debug("Skip dead PDF href %s", href)
+                        seen_pdfs.add(href)  # don't retry
+                    else:
+                        seen_pdfs.add(href)
+                        pdfs.append(
+                            {
+                                "title": link.get("text") or None,
+                                "authors": None,
+                                "pdf_url": href,
+                                "doi": None,
+                                "source": "link",
+                                "page_url": url,
+                            }
+                        )
             elif kind == "article":
                 # NEVER synthesize download IDs — open the article page and extract real PDF hrefs.
                 # This is the root fix for mass 404s on OJS (.../download/N/M/pdf guessed wrong).
@@ -695,7 +777,8 @@ def discover_from_seeds(
             logger.warning("Sample paper crawl failed %s: %s", u, e)
 
     if listing_urls:
-        crawled = generic_discover(listing_urls)
+        ordered_listings = sorted(listing_urls, key=_seed_priority)
+        crawled = generic_discover(ordered_listings, max_pages=MAX_PAGES, max_depth=MAX_DEPTH, max_pdfs=MAX_PDFS)
         for p in crawled:
             if p["pdf_url"] not in seen:
                 seen.add(p["pdf_url"])
