@@ -28,6 +28,89 @@ MAX_PAGES = 200
 MAX_DEPTH = 4
 MAX_PDFS = 800
 
+def find_pagination_links(html: str, base_url: str) -> List[str]:
+    """
+    Smart pagination: collect next/prev and numbered page links from the current listing.
+    Covers OJS (?page=N), DSpace (offset=), WordPress, rel=next, and "Next" anchors.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    origin = _origin(base_url)
+    found: Set[str] = set()
+    out: List[str] = []
+
+    def add(u: Optional[str]):
+        if not u or u in found:
+            return
+        if not _same_site(u, origin) and "web.archive.org" not in u:
+            return
+        found.add(u)
+        out.append(u)
+
+    # rel="next" / rel="prev"
+    for a in soup.find_all("a", href=True):
+        rel = " ".join(a.get("rel") or []).lower()
+        text = (a.get_text(" ", strip=True) or "").lower()
+        href = _resolve(a["href"], base_url)
+        if not href:
+            continue
+        if "next" in rel or text in ("next", "›", "»", "older", "next page", "→"):
+            add(href)
+        elif re.search(r"\bnext\b|next\s*page|older\s*posts", text, re.I):
+            add(href)
+        # Numbered pages: page=2, /page/2, offset=60, start=60
+        if re.search(r"[?&](page|p|pg|currentPage|offset|start|rpp)=\d+", href, re.I):
+            add(href)
+        if re.search(r"/page/\d+/?$", href, re.I):
+            add(href)
+
+    # OJS issue pagination: /issue/view/123/4 (galley-style) already classified as listing
+    # Synthesize sequential page=N from current URL if we only have page=1
+    try:
+        from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+        parsed = urlparse(base_url)
+        qs = parse_qs(parsed.query)
+        cur = None
+        for key in ("page", "p", "pg", "currentPage"):
+            if key in qs and qs[key]:
+                try:
+                    cur = int(qs[key][0])
+                except ValueError:
+                    cur = None
+                if cur is not None:
+                    for n in range(max(1, cur - 1), cur + 8):
+                        if n == cur:
+                            continue
+                        new_qs = dict(qs)
+                        new_qs[key] = [str(n)]
+                        q = urlencode({k: v[0] if len(v) == 1 else v for k, v in new_qs.items()}, doseq=True)
+                        add(urlunparse(parsed._replace(query=q)))
+                    break
+        # offset-based (DSpace): offset=0,20,40…
+        if "offset" in qs and qs["offset"]:
+            try:
+                off = int(qs["offset"][0])
+            except ValueError:
+                off = 0
+            step = 20
+            if "rpp" in qs and qs["rpp"]:
+                try:
+                    step = int(qs["rpp"][0]) or 20
+                except ValueError:
+                    step = 20
+            for n in range(0, step * 15, step):
+                if n == off:
+                    continue
+                new_qs = dict(qs)
+                new_qs["offset"] = [str(n)]
+                q = urlencode({k: v[0] if len(v) == 1 else v for k, v in new_qs.items()}, doseq=True)
+                add(urlunparse(parsed._replace(query=q)))
+    except Exception:
+        pass
+
+    return out
+
+
+
 
 def _session() -> requests.Session:
     s = requests.Session()
@@ -482,9 +565,10 @@ def generic_discover(
 
         links = extract_links_from_html(html, url)
 
-        # If this looks like an article page, also dig for embedded PDFs
+        # Always pull PDF hrefs that actually appear on this page (article or listing).
+        # Never invent /article/download/{id}/{galley} numbers.
         page_kind = classify_link(url)
-        if page_kind == "article" or any(l["kind"] == "pdf" for l in links) is False:
+        if page_kind in ("article", None) or any(l["kind"] == "pdf" for l in links):
             for pdf in extract_pdfs_from_article_page(html, url):
                 if pdf not in seen_pdfs:
                     seen_pdfs.add(pdf)
@@ -516,25 +600,19 @@ def generic_discover(
                         }
                     )
             elif kind == "article":
-                # OJS + IJIRCT-style: synthesize download URLs without opening every HTML page
-                for cand in ojs_download_candidates(href) + paper_download_candidates(href):
-                    if cand not in seen_pdfs:
-                        seen_pdfs.add(cand)
-                        pdfs.append(
-                            {
-                                "title": link.get("text") or None,
-                                "authors": None,
-                                "pdf_url": cand,
-                                "doi": None,
-                                "source": "synth_download",
-                                "page_url": href,
-                            }
-                        )
+                # NEVER synthesize download IDs — open the article page and extract real PDF hrefs.
+                # This is the root fix for mass 404s on OJS (.../download/N/M/pdf guessed wrong).
                 if depth < max_depth and href not in visited:
                     queue.append((href, depth + 1))
             elif kind == "listing" and depth < max_depth:
                 if href not in visited:
                     queue.append((href, depth + 1))
+
+        # Smart pagination: enqueue next/numbered listing pages from this HTML
+        if depth < max_depth:
+            for next_url in find_pagination_links(html, url):
+                if next_url not in visited:
+                    queue.append((next_url, depth + 1))
 
         if pages_fetched % 10 == 0:
             logger.info(
@@ -606,27 +684,9 @@ def discover_from_seeds(
             )
             continue
 
-        # OJS article/view → try direct download URLs first (avoids flaky HTML fetches)
-        ojs_urls = ojs_download_candidates(u)
-        if ojs_urls:
-            for cand in ojs_urls:
-                if cand not in seen and "download" in cand:
-                    seen.add(cand)
-                    results.append(
-                        {
-                            "title": None,
-                            "authors": None,
-                            "pdf_url": cand,
-                            "doi": None,
-                            "source": "ojs_download",
-                            "page_url": u,
-                        }
-                    )
-            continue
-
-        # Non-OJS article page: light crawl
+        # Article/view URL: open the page and extract real PDF links only (no guessed download IDs)
         try:
-            found = generic_discover([u], max_pages=3, max_depth=1, max_pdfs=10)
+            found = generic_discover([u], max_pages=5, max_depth=2, max_pdfs=20)
             for p in found:
                 if p["pdf_url"] not in seen:
                     seen.add(p["pdf_url"])
