@@ -64,47 +64,66 @@ def extract_emails_from_text(text: str) -> List[str]:
 
 
 def download_pdf(url: str) -> bytes:
+    """
+    Download a PDF from a page-sourced URL.
+    - Fail fast on origin 404/410 (no point hammering retries).
+    - Wayback only as a single fallback for previously-valid hrefs, not for guessed paths.
+    """
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "application/pdf,application/octet-stream,*/*",
         "Connection": "close",
     }
-    candidates = [url]
-    if "web.archive.org" not in url:
-        candidates.append(f"https://web.archive.org/web/2/{url}")
+
+    def _try_once(target: str, timeout: int):
+        resp = requests.get(
+            target,
+            headers=headers,
+            timeout=timeout,
+            stream=True,
+            allow_redirects=True,
+        )
+        if resp.status_code in (404, 410):
+            raise FileNotFoundError(f"404 Client Error: NOT FOUND for url: {target}")
+        if resp.status_code in (403, 503) and (
+            "cloudflare" in (resp.headers.get("server") or "").lower()
+            or "just a moment" in (resp.text or "")[:1500].lower()
+        ):
+            raise RuntimeError(f"Cloudflare blocked PDF {target}")
+        resp.raise_for_status()
+        data = resp.content
+        if data.startswith(b"%PDF"):
+            return data
+        if b"%PDF" in data[:4000]:
+            return data[data.find(b"%PDF"):]
+        raise ValueError(
+            f"Downloaded content is not a PDF (url={target}, ctype={resp.headers.get('Content-Type')}, len={len(data)})"
+        )
 
     last_err = None
-    for target in candidates:
-        for attempt in range(3):
-            try:
-                resp = requests.get(
-                    target,
-                    headers=headers,
-                    timeout=REQUEST_TIMEOUT + (20 if "web.archive.org" in target else 0),
-                    stream=True,
-                    allow_redirects=True,
-                )
-                # Cloudflare HTML challenge is not a PDF
-                if resp.status_code in (403, 503) and (
-                    "cloudflare" in (resp.headers.get("server") or "").lower()
-                    or "just a moment" in (resp.text or "")[:1500].lower()
-                ):
-                    last_err = RuntimeError(f"Cloudflare blocked PDF {target}")
-                    break
-                resp.raise_for_status()
-                data = resp.content
-                if data.startswith(b"%PDF"):
-                    return data
-                if b"%PDF" in data[:4000]:
-                    idx = data.find(b"%PDF")
-                    return data[idx:]
-                raise ValueError(
-                    f"Downloaded content is not a PDF (url={target}, ctype={resp.headers.get('Content-Type')}, len={len(data)})"
-                )
-            except Exception as e:
-                last_err = e
-                import time
-                time.sleep(min(12, 2 ** attempt))
+    # Origin: up to 2 attempts
+    for attempt in range(2):
+        try:
+            return _try_once(url, REQUEST_TIMEOUT)
+        except FileNotFoundError as e:
+            last_err = e
+            break  # dead link — don't retry origin
+        except Exception as e:
+            last_err = e
+            import time
+            time.sleep(min(6, 2 ** attempt))
+
+    # Wayback once only (skip if URL already archive, or if origin was hard 404 on a synth-looking path)
+    if "web.archive.org" not in url:
+        looks_guessed = bool(
+            __import__("re").search(r"article/download/\d+(/\d+)?(/pdf)?/?$", url, __import__("re").I)
+        )
+        # Still allow wayback for page-sourced download hrefs; cheap single try
+        try:
+            return _try_once(f"https://web.archive.org/web/2/{url}", REQUEST_TIMEOUT + 15)
+        except Exception as e:
+            last_err = e
+
     raise last_err  # type: ignore
 
 
