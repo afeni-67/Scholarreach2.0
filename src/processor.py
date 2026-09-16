@@ -155,7 +155,7 @@ def process_app_extraction_job(job: dict, worker_id: str) -> None:
     PARALLEL = 6
     total_pdfs = len(pdf_urls)
     # Cap work to ~2× target papers as a safety bound
-    work_list = pdf_urls[: max(target * 3, 50)]
+    work_list = pdf_urls[: max(target * 8, 200)]  # allow multi-issue journals
 
     def _one(pdf_url: str):
         try:
