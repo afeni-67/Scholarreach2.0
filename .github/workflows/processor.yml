@@ -2,10 +2,9 @@ name: Scholarreach Processor
 
 on:
   schedule:
-    # Every 2 hours. With 10 workers per run, two waves fit under GitHub Free
-    # concurrent limit (20). Overlap is real: wave B starts while wave A still runs.
-    # Minute 17 avoids the top-of-hour Actions schedule pile-up that causes skips.
-    - cron: "17 */2 * * *"
+    # Every hour. 10 workers x ~2 overlapping waves stays under Free (20 concurrent).
+    # Hourly beats GitHub schedule drift that left multi-hour dead gaps on */2.
+    - cron: "12 * * * *"
   workflow_dispatch:
     inputs:
       max_hours:
