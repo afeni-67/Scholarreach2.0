@@ -9,7 +9,7 @@ JOBS_COLLECTION = "jobs"
 RESULTS_COLLECTION = "results"
 
 # Claim timeout: if a job stays in "processing" longer than this, it can be reclaimed
-CLAIM_TIMEOUT_MINUTES = int(os.getenv("CLAIM_TIMEOUT_MINUTES", "120"))
+CLAIM_TIMEOUT_MINUTES = int(os.getenv("CLAIM_TIMEOUT_MINUTES", "180"))  # 3h — long multi-issue crawls
 
 # Max attempts before marking failed permanently
 MAX_ATTEMPTS = int(os.getenv("MAX_ATTEMPTS", "5"))
