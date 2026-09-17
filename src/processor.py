@@ -77,7 +77,27 @@ def process_app_extraction_job(job: dict, worker_id: str) -> None:
     )
 
     from src.scraper import discover_from_seeds
+    import threading
 
+    # Keep heartbeat alive during long multi-issue discovery so another worker
+    # does not "reclaim" and appear to cancel this job.
+    stop_hb = threading.Event()
+
+    def _hb_loop():
+        n = 0
+        while not stop_hb.wait(25):
+            n += 1
+            try:
+                app_jobs.update_job_progress(
+                    job_id,
+                    stage=f"Discovering papers for {journal}… (still crawling issues)",
+                    progress=min(18, 5 + n),
+                )
+            except Exception:
+                pass
+
+    hb_thread = threading.Thread(target=_hb_loop, daemon=True)
+    hb_thread.start()
     try:
         papers = discover_from_seeds(
             listing_urls=listing_urls,
@@ -85,6 +105,7 @@ def process_app_extraction_job(job: dict, worker_id: str) -> None:
             sample_paper_urls=sample_urls,
         )
     except Exception as e:
+        stop_hb.set()
         logger.exception("Discovery failed for job %s: %s", job_id, e)
         app_jobs.complete_app_job(
             job_id,
@@ -92,6 +113,8 @@ def process_app_extraction_job(job: dict, worker_id: str) -> None:
             stage=f"Discovery failed: {str(e)[:100]}",
         )
         return
+    finally:
+        stop_hb.set()
 
     pdf_urls = []
     seen = set()
