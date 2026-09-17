@@ -14,11 +14,9 @@ on:
   repository_dispatch:
     types: [enqueue, process]
 
-# Never cancel an older wave when a newer one starts
-# Shared group: next schedule waits for current wave (avoids 20+20 pile-up / reclaim chaos)
-concurrency:
-  group: scholarreach-processor
-  cancel-in-progress: false
+# No concurrency group — allows staggered dual waves (wave A + wave B after 3h).
+# wakeWorkers enforces max 2 active runs so we stay within GitHub Free (20 jobs).
+# cancel-in-progress is NOT used so an older wave is never killed when the next starts.
 
 jobs:
   process:
@@ -27,9 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 10 workers × 2 overlapping runs = 20 = GitHub Free max concurrent jobs.
-        # Using 20 per run made the next scheduled wave sit queued (or get delayed)
-        # until the first wave finished — so you never saw a true second runner.
+        # 10 workers per wave. wakeWorkers starts wave #2 after 3h → 20 jobs max (Free tier).
         worker: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     steps:
       - name: Checkout
