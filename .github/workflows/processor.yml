@@ -2,9 +2,9 @@ name: Scholarreach Processor
 
 on:
   schedule:
-    # Every hour. 10 workers x ~2 overlapping waves stays under Free (20 concurrent).
-    # Hourly beats GitHub schedule drift that left multi-hour dead gaps on */2.
-    - cron: "12 * * * *"
+    # Every 3 hours (minute 12). Keeps ~3h spacing; wakeWorkers also enforces min gap.
+    # GitHub cron can drift a few minutes — that is normal.
+    - cron: "12 */3 * * *"
   workflow_dispatch:
     inputs:
       max_hours:
