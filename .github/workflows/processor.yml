@@ -15,8 +15,9 @@ on:
     types: [enqueue, process]
 
 # Never cancel an older wave when a newer one starts
+# Shared group: next schedule waits for current wave (avoids 20+20 pile-up / reclaim chaos)
 concurrency:
-  group: scholarreach-processor-${{ github.run_id }}
+  group: scholarreach-processor
   cancel-in-progress: false
 
 jobs:
