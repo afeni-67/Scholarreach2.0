@@ -240,7 +240,7 @@ def get_already_processed_pdfs(job_id) -> set:
     return urls
 
 
-def mark_pdf_processed(job_id, pdf_url: str):
+def mark_pdf_processed(job_id, pdf_url: str, user_id=None, journal: str = None):
     """Append pdf_url to processedPdfUrls on the job (idempotent-ish)."""
     if not pdf_url:
         return
@@ -251,7 +251,86 @@ def mark_pdf_processed(job_id, pdf_url: str):
             "$set": {"lastHeartbeatAt": datetime.now(timezone.utc), "currentUrl": pdf_url},
         },
     )
+    if user_id and journal:
+        try:
+            save_journal_progress(user_id, journal, processed_pdf=pdf_url)
+        except Exception:
+            pass
 
+
+
+
+def get_user_journal_processed_pdfs(user_id, journal: str) -> set:
+    """
+    Papers this user already extracted for this journal (any past job).
+    Used so a new "scrape more" job skips rediscovering/re-reading those PDFs.
+    """
+    urls = set()
+    if not user_id:
+        return urls
+    q = {"userId": user_id}
+    # extractedemails may store journal; paperUrl is enough to skip
+    try:
+        for doc in extracted_emails().find(q, {"paperUrl": 1, "journal": 1}):
+            u = (doc.get("paperUrl") or "").strip()
+            if not u:
+                continue
+            j = (doc.get("journal") or "").strip()
+            if journal and j and j != journal and not (
+                journal.startswith("custom-") and j.startswith("custom-")
+            ):
+                # if journal field set and differs, skip
+                if j.lower() != str(journal).lower():
+                    continue
+            urls.add(u)
+    except Exception:
+        pass
+    # Also UserJournal.processedPaperUrls if present
+    try:
+        uj = user_journals().find_one({"userId": user_id, "slug": journal})
+        if not uj and journal:
+            uj = user_journals().find_one({"userId": user_id, "seedUrl": journal})
+        if uj:
+            for u in uj.get("processedPaperUrls") or []:
+                if u:
+                    urls.add(u)
+            for u in uj.get("discoveredPdfUrls") or []:
+                pass  # discovered but not processed — still try
+    except Exception:
+        pass
+    return urls
+
+
+def save_journal_progress(user_id, journal: str, *, discovered_pdfs=None, processed_pdf=None, listing_urls=None):
+    """Persist crawl progress on UserJournal so the next job continues."""
+    if not user_id or not journal:
+        return
+    try:
+        coll = user_journals()
+        q = {"userId": user_id, "slug": journal}
+        uj = coll.find_one(q)
+        if not uj:
+            q = {"userId": user_id, "seedUrl": journal}
+            uj = coll.find_one(q)
+        if not uj:
+            return
+        upd = {"$set": {"updatedAt": datetime.now(timezone.utc)}}
+        if processed_pdf:
+            upd.setdefault("$addToSet", {})["processedPaperUrls"] = processed_pdf
+        if discovered_pdfs:
+            # store a rolling window of discovered URLs (cap in app)
+            urls = list(discovered_pdfs)[:3000]
+            upd["$set"]["discoveredPdfUrls"] = urls
+            upd["$set"]["papersFound"] = len(urls)
+        if listing_urls:
+            upd["$set"]["listingUrls"] = list(listing_urls)[:200]
+        coll.update_one({"_id": uj["_id"]}, upd)
+    except Exception as e:
+        __import__("logging").getLogger(__name__).warning("save_journal_progress: %s", e)
+
+
+def user_journals():
+    return app_db()[USER_JOURNALS]
 
 
 def get_journal_seed_urls(journal: str, user_id) -> Dict[str, List[str]]:
@@ -290,6 +369,12 @@ def get_journal_seed_urls(journal: str, user_id) -> Dict[str, List[str]]:
         result["listingUrls"] = listings
         result["pdfUrls"] = uj.get("pdfUrls") or []
         result["samplePaperUrls"] = uj.get("samplePaperUrls") or []
+        # Prefer previously discovered PDF queue so we continue instead of full rediscovery
+        cached = uj.get("discoveredPdfUrls") or []
+        if cached:
+            result["pdfUrls"] = list(cached)[:2500]
+        if uj.get("listingUrls"):
+            result["listingUrls"] = list(uj.get("listingUrls") or result["listingUrls"])
 
     # Custom user journal — tolerate ObjectId / str userId and case variants
     if user_id is not None:
