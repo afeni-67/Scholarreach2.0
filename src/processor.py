@@ -132,15 +132,26 @@ def process_app_extraction_job(job: dict, worker_id: str) -> None:
         )
         return
 
-    # --- Checkpoint: skip PDFs already processed for this job ---
+    # --- Checkpoint: skip PDFs already processed (this job + this user's journal history) ---
     already = app_jobs.get_already_processed_pdfs(job_id)
+    user_done = app_jobs.get_user_journal_processed_pdfs(user_id, journal)
+    already = already | user_done
     if already:
         before = len(pdf_urls)
         pdf_urls = [u for u in pdf_urls if u not in already]
         logger.info(
-            "Job %s checkpoint: skipping %d already-processed PDFs, %d remaining",
-            job_id, before - len(pdf_urls), len(pdf_urls),
+            "Job %s smart-continue: skip %d already-done PDFs (%d user-journal history), %d remaining",
+            job_id, before - len(pdf_urls), len(user_done), len(pdf_urls),
         )
+    # Persist full discovery list so next job can continue without full re-crawl when possible
+    try:
+        app_jobs.save_journal_progress(
+            user_id, journal,
+            discovered_pdfs=(list(already) + pdf_urls)[:3000],
+            listing_urls=listing_urls,
+        )
+    except Exception:
+        pass
 
     # Restore email/paper counts from DB so UI doesn't reset
     existing_emails = int(job.get("emailsCollected") or 0)
@@ -202,7 +213,7 @@ def process_app_extraction_job(job: dict, worker_id: str) -> None:
 
             if err is not None:
                 errors += 1
-                app_jobs.mark_pdf_processed(job_id, pdf_url)  # don't retry this URL forever
+                app_jobs.mark_pdf_processed(job_id, pdf_url, user_id=user_id, journal=journal)  # don't retry this URL forever
                 if errors <= 5 or errors % 20 == 0:
                     logger.warning("Extract failed %s: %s", pdf_url, err)
                 continue
@@ -210,7 +221,7 @@ def process_app_extraction_job(job: dict, worker_id: str) -> None:
             title = (result or {}).get("title") or ""
             emails = (result or {}).get("emails") or []
             added = app_jobs.push_emails_for_job(job, emails, paper_url=pdf_url, title=title)
-            app_jobs.mark_pdf_processed(job_id, pdf_url)
+            app_jobs.mark_pdf_processed(job_id, pdf_url, user_id=user_id, journal=journal)
             emails_total += added
             papers_done += 1
 
