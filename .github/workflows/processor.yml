@@ -1,7 +1,7 @@
 name: Scholarreach Processor
 
 on:
-  # Render wakeWorkers is the only automatic trigger (reliable, no schedule drift).
+  # Render wakeWorkers only — starts wave A, then wave B at +3h, etc.
   workflow_dispatch:
     inputs:
       max_hours:
@@ -11,11 +11,10 @@ on:
   repository_dispatch:
     types: [enqueue, process]
 
-# Hard cap: only ONE wave at a time (20 workers = Free tier max).
-# Next wave starts only after this one finishes (Render wakes ~2 min later or sooner).
-concurrency:
-  group: scholarreach-processor
-  cancel-in-progress: false
+# No concurrency group — allows wave B to start while wave A is still running.
+# GitHub Free max concurrent jobs is 20: if both waves have 20 matrix jobs,
+# the second wave is accepted but its jobs queue until slots free. wakeWorkers
+# still caps at 2 active workflow runs so we do not pile up forever.
 
 jobs:
   process:
@@ -24,7 +23,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 20 workers in a single wave = GitHub Free concurrent job limit.
         worker: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
     steps:
       - name: Checkout
@@ -51,7 +49,7 @@ jobs:
         run: |
           MAX_H="${{ github.event.inputs.max_hours || '5.5' }}"
           MAX_S=$(python -c "print(int(float('$MAX_H') * 3600))")
-          echo "Starting Scholarreach worker ${{ matrix.worker }} (max ${MAX_S}s, poll every 3s)..."
+          echo "Starting Scholarreach worker ${{ matrix.worker }} (max ${MAX_S}s)..."
           python -c "
           from src.processor import run_loop
           run_loop(max_runtime_seconds=$MAX_S, idle_sleep=3)
