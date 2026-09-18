@@ -66,9 +66,14 @@ def extract_emails_from_text(text: str) -> List[str]:
 def download_pdf(url: str) -> bytes:
     """
     Download a PDF from a page-sourced URL.
-    - Fail fast on origin 404/410 (no point hammering retries).
-    - Wayback only as a single fallback for previously-valid hrefs, not for guessed paths.
+    - Reject relative / non-http URLs immediately.
+    - Fail fast on origin 404/410 (no wayback).
+    - Other failures: one short Wayback try only (skip guessed OJS paths).
     """
+    url = (url or "").strip()
+    if not url or not url.lower().startswith(("http://", "https://")):
+        raise ValueError(f"Not an absolute PDF URL: {url[:120]!r}")
+
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "application/pdf,application/octet-stream,*/*",
@@ -95,117 +100,38 @@ def download_pdf(url: str) -> bytes:
         if data.startswith(b"%PDF"):
             return data
         if b"%PDF" in data[:4000]:
-            return data[data.find(b"%PDF"):]
+            return data[data.find(b"%PDF") :]
         raise ValueError(
             f"Downloaded content is not a PDF (url={target}, ctype={resp.headers.get('Content-Type')}, len={len(data)})"
         )
 
     last_err = None
-    # Origin: up to 2 attempts
     for attempt in range(2):
         try:
             return _try_once(url, REQUEST_TIMEOUT)
         except FileNotFoundError as e:
             last_err = e
-            break  # dead link — don't retry origin
+            break
         except Exception as e:
             last_err = e
             import time
-            time.sleep(min(6, 2 ** attempt))
 
-    # Wayback once only (skip if URL already archive, or if origin was hard 404 on a synth-looking path)
-    if "web.archive.org" not in url:
-        looks_guessed = bool(
-            __import__("re").search(r"article/download/\d+(/\d+)?(/pdf)?/?$", url, __import__("re").I)
-        )
-        # Still allow wayback for page-sourced download hrefs; cheap single try
+            time.sleep(min(4, 2 ** attempt))
+
+    # No Wayback on hard 404 — saves minutes of archive timeouts
+    if isinstance(last_err, FileNotFoundError):
+        raise last_err
+
+    import re as _re
+
+    looks_guessed = bool(_re.search(r"article/download/\d+(/\d+)?(/pdf)?/?$", url, _re.I))
+    if "web.archive.org" not in url and not looks_guessed:
         try:
-            return _try_once(f"https://web.archive.org/web/2/{url}", REQUEST_TIMEOUT + 15)
+            return _try_once(f"https://web.archive.org/web/2/{url}", min(20, REQUEST_TIMEOUT + 5))
         except Exception as e:
             last_err = e
 
-    raise last_err  # type: ignore
-
-
-def extract_title_and_emails(pdf_bytes: bytes) -> Tuple[Optional[str], List[str]]:
-    """
-    Returns (title, emails).
-    Title preference: PDF metadata /Title → first non-empty line on page 1 that looks like a title.
-    """
-    title: Optional[str] = None
-    full_text_parts: List[str] = []
-
-    # --- pypdf path ---
-    try:
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        meta = reader.metadata
-        if meta and meta.title:
-            t = str(meta.title).strip()
-            if t and t.lower() not in ("untitled", "unknown", ""):
-                title = t
-
-        # first 3 pages text is usually enough for title + corresponding author
-        for i, page in enumerate(reader.pages[:2]):
-            try:
-                txt = page.extract_text() or ""
-                full_text_parts.append(txt)
-            except Exception:
-                continue
-    except Exception as e:
-        logger.warning("pypdf failed: %s", e)
-
-    # --- pdfplumber fallback / enrichment ---
-    try:
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            if not title and pdf.pages:
-                # try first page top text
-                first = pdf.pages[0]
-                words = first.extract_words(keep_blank_chars=False) or []
-                # crude title heuristic: largest font size near top
-                if words:
-                    # sort by size desc then top position
-                    candidates = sorted(
-                        words,
-                        key=lambda w: (-float(w.get("size", 0) or 0), float(w.get("top", 9999))),
-                    )
-                    # take a few top large words and join nearby
-                    top_line = " ".join(c["text"] for c in candidates[:12])
-                    if len(top_line) > 15:
-                        title = top_line[:300].strip()
-
-            for page in pdf.pages[:2]:
-                try:
-                    txt = page.extract_text() or ""
-                    if txt:
-                        full_text_parts.append(txt)
-                except Exception:
-                    continue
-    except Exception as e:
-        logger.warning("pdfplumber failed: %s", e)
-
-    text = "\n".join(full_text_parts)
-
-    # Clean title
-    if title:
-        title = re.sub(r"\s+", " ", title).strip()
-        # remove common journal header noise
-        for noise in ("International Journal of", "IJETRM", "ISSN:", "Impact Factor"):
-            if title.upper().startswith(noise.upper()):
-                # try next line heuristic later if needed
-                pass
-        if len(title) < 8:
-            title = None
-
-    # Fallback title from first substantial line
-    if not title:
-        for line in text.splitlines():
-            line = line.strip()
-            if len(line) > 20 and not line.lower().startswith(("abstract", "keywords", "volume", "issn", "doi")):
-                title = line[:300]
-                break
-
-    emails = extract_emails_from_text(text)
-    return title, emails
+    raise last_err if last_err else RuntimeError(f"Failed to download PDF: {url}")
 
 
 def process_pdf_url(pdf_url: str) -> dict:
