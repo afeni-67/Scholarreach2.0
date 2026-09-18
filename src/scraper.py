@@ -412,6 +412,17 @@ def classify_link(url: str, text_hint: str = "") -> Optional[str]:
     if re.search(r"/pdf/", u, re.I) and not re.search(r"journal", u, re.I):
         return "pdf"
 
+    # OJS/AJOL galley under view: /article/view/{articleId}/{galleyId}
+    # (returns application/pdf on AJOL and many OJS hosts — NOT the HTML abstract)
+    if re.search(r"article/view/\d+/\d+", u, re.I):
+        return "pdf"
+
+    # Link text says PDF (AJOL: "download PDF")
+    if t.strip() in ("pdf", "download pdf", "view pdf", "full text pdf", "download") and re.search(r"article/view/\d+", u, re.I):
+        return "pdf"
+    if "pdf" in t and re.search(r"article/view/\d+/\d+", u, re.I):
+        return "pdf"
+
     # DSpace / EPrints bitstream
     if re.search(r"/bitstream/", u, re.I) and not re.search(r"/cert/", u, re.I):
         return "pdf"
@@ -424,10 +435,13 @@ def classify_link(url: str, text_hint: str = "") -> Optional[str]:
     if re.search(r"/files?/\d+", u, re.I) and re.search(r"\.(pdf|doc)", u, re.I):
         return "pdf"
 
-    # Article HTML pages
+    # Article HTML pages (view with ONLY article id, no galley id)
     if re.search(r"/show-\d+-\d+", u, re.I):
         return "article"
+    if re.search(r"article/view/\d+/?$", u, re.I) or re.search(r"article/view/\d+(\?|$)", u, re.I):
+        return "article"
     if re.search(r"article/view/", u, re.I):
+        # fallback: still article unless matched galley above
         return "article"
     if re.search(r"/articles?/", u, re.I) and not re.search(r"archive|issue|volume|list-", u, re.I):
         return "article"
