@@ -651,50 +651,121 @@ def extract_pdfs_from_article_page(html: str, base_url: str) -> List[str]:
     return pdfs
 
 
-def scrape_ijetrm_issue(issue_url: str) -> List[Dict[str, Any]]:
-    html = _get(issue_url)
-    soup = BeautifulSoup(html, "lxml")
+def _ijetrm_collect_pdfs(html: str, page_url: str) -> List[Dict[str, Any]]:
+    """Pull PDF URLs from one IJETRM issue/volume HTML page."""
+    soup = BeautifulSoup(html or "", "lxml")
     papers: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
 
-    for meta in soup.find_all("meta", attrs={"name": "citation_pdf_url"}):
-        pdf = (meta.get("content") or "").strip()
-        if pdf and pdf.lower().endswith(".pdf"):
-            papers.append(
-                {
-                    "title": None,
-                    "authors": None,
-                    "pdf_url": pdf,
-                    "doi": None,
-                    "source": "meta",
-                    "page_url": issue_url,
-                }
-            )
+    def add(pdf: str, title=None, source="meta"):
+        pdf = (pdf or "").strip()
+        if not pdf or not pdf.lower().startswith("http"):
+            return
+        if not (pdf.lower().endswith(".pdf") or "/issues/files/" in pdf.lower()):
+            if ".pdf" not in pdf.lower():
+                return
+        if pdf in seen:
+            return
+        seen.add(pdf)
+        papers.append(
+            {
+                "title": title,
+                "authors": None,
+                "pdf_url": pdf,
+                "doi": None,
+                "source": source,
+                "page_url": page_url,
+            }
+        )
+
+    for meta in soup.find_all("meta", attrs={"name": re.compile(r"citation_pdf_url", re.I)}):
+        add(meta.get("content") or "", source="meta")
 
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        if ".pdf" in href.lower():
-            full = urljoin(issue_url, href)
-            if not any(p["pdf_url"] == full for p in papers):
-                papers.append(
-                    {
-                        "title": a.get_text(strip=True) or None,
-                        "authors": None,
-                        "pdf_url": full,
-                        "doi": None,
-                        "source": "anchor",
-                        "page_url": issue_url,
-                    }
-                )
+        full = urljoin(page_url, href)
+        if ".pdf" in full.lower() or "/issues/files/" in full.lower():
+            add(full, title=a.get_text(strip=True) or None, source="anchor")
+    return papers
 
-    # Deduplicate
-    seen = set()
-    unique = []
-    for p in papers:
-        if p["pdf_url"] not in seen:
-            seen.add(p["pdf_url"])
-            unique.append(p)
-    logger.info("IJETRM issue %s → %d PDF links", issue_url, len(unique))
-    return unique
+
+def scrape_ijetrm_issue(issue_url: str) -> List[Dict[str, Any]]:
+    """
+    IJETRM hosts PDFs under /issues/files/*.pdf and citation_pdf_url meta.
+    Volume index is /issue/?volume=Month~Year (and volume=current).
+    Crawl current + archive volume links so jobs are not stuck on one month.
+    """
+    # Normalize common typos / bare domain
+    u = (issue_url or "").strip()
+    if re.search(r"ijertm\.com", u, re.I):  # frequent misspelling
+        u = re.sub(r"ijertm\.com", "ijetrm.com", u, flags=re.I)
+    if re.match(r"^https?://(www\.)?ijetrm\.com/?$", u, re.I):
+        u = "https://ijetrm.com/issue/?volume=current"
+    if "ijetrm.com" in u.lower() and "/issue" not in u.lower():
+        u = "https://ijetrm.com/issue/?volume=current"
+
+    papers: List[Dict[str, Any]] = []
+    seen_pdf: Set[str] = set()
+    volumes: List[str] = []
+    seen_vol: Set[str] = set()
+
+    def enqueue_vol(v: str):
+        v = (v or "").split("#")[0]
+        if not v or v in seen_vol:
+            return
+        if "ijetrm.com" not in v.lower():
+            return
+        seen_vol.add(v)
+        volumes.append(v)
+
+    enqueue_vol(u)
+    enqueue_vol("https://ijetrm.com/issue/?volume=current")
+    enqueue_vol("https://ijetrm.com/issue/")
+
+    # First pass: open index pages to collect volume= links
+    for seed in list(volumes)[:5]:
+        try:
+            html = _get(seed)
+        except Exception as e:
+            logger.warning("IJETRM fetch failed %s: %s", seed, e)
+            continue
+        for p in _ijetrm_collect_pdfs(html, seed):
+            if p["pdf_url"] not in seen_pdf:
+                seen_pdf.add(p["pdf_url"])
+                papers.append(p)
+        soup = BeautifulSoup(html or "", "lxml")
+        for a in soup.find_all("a", href=True):
+            full = urljoin(seed, a["href"]).split("#")[0]
+            if "volume=" in full.lower() or re.search(r"/issue/\?volume=", full, re.I):
+                enqueue_vol(full)
+
+    # Prefer recent volumes first (current, 2026, 2025, …)
+    def vol_key(v: str):
+        if "volume=current" in v.lower():
+            return (0, "")
+        m = re.search(r"volume=([^&]+)", v, re.I)
+        return (1, (m.group(1) if m else v))
+
+    ordered = sorted(volumes, key=vol_key)
+    # Cap volume pages so one job does not crawl the entire 2017–2026 archive forever
+    max_volumes = 24
+    for vol in ordered[:max_volumes]:
+        if vol in ("https://ijetrm.com/issue/",) and papers:
+            continue
+        try:
+            html = _get(vol)
+        except Exception as e:
+            logger.warning("IJETRM volume failed %s: %s", vol, e)
+            continue
+        for p in _ijetrm_collect_pdfs(html, vol):
+            if p["pdf_url"] not in seen_pdf:
+                seen_pdf.add(p["pdf_url"])
+                papers.append(p)
+        if len(papers) >= MAX_PDFS:
+            break
+
+    logger.info("IJETRM %s → %d PDF links across %d volume seeds", issue_url, len(papers), len(ordered[:max_volumes]))
+    return papers[:MAX_PDFS]
 
 
 def generic_discover(
@@ -841,7 +912,8 @@ def discover_papers(url: str) -> List[Dict[str, Any]]:
     Dispatch: IJETRM-specific fast path, otherwise generic crawler.
     """
     domain = urlparse(url).netloc.lower()
-    if "ijetrm.com" in domain:
+    # IJETRM (+ common typo ijertm.com)
+    if "ijetrm.com" in domain or "ijertm.com" in domain:
         return scrape_ijetrm_issue(url)
     return generic_discover([url])
 
