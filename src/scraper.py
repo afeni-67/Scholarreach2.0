@@ -227,12 +227,29 @@ def _session() -> requests.Session:
 
 
 def _is_cloudflare_block(resp: requests.Response) -> bool:
-    if resp.status_code in (403, 503):
-        body = (resp.text or "")[:2000].lower()
-        if "just a moment" in body or "cf-mitigated" in (resp.headers.get("cf-mitigated") or "").lower():
+    """True for Cloudflare OR AWS WAF JS challenges (common on AJOL, BMJ, etc.)."""
+    status = resp.status_code
+    body = (resp.text or "")[:4000].lower()
+    headers = {k.lower(): (v or "") for k, v in (resp.headers or {}).items()}
+
+    # AWS WAF challenge (AJOL returns 202 + x-amzn-waf-action: challenge)
+    if status in (202, 401, 403, 405, 503):
+        if "x-amzn-waf-action" in headers or "awswaf" in body or "challenge.js" in body:
+            return True
+        if "gokuprops" in body or "aws-waf-token" in body:
+            return True
+    if status in (403, 503, 429):
+        if "just a moment" in body or "cf-mitigated" in headers.get("cf-mitigated", "").lower():
             return True
         if "cloudflare" in body and ("challenge" in body or "enable javascript" in body):
             return True
+        if "cf-browser-verification" in body or "attention required" in body:
+            return True
+    # Empty/tiny challenge shells
+    if status in (200, 202) and len(body) < 8000 and (
+        "challenge-container" in body or "awswafintegration" in body
+    ):
+        return True
     return False
 
 
@@ -272,11 +289,22 @@ def _get(url: str, session: Optional[requests.Session] = None, retries: int = 3)
                     logger.warning("Cloudflare block on %s — will try fallback", target)
                     last_err = RuntimeError(f"Cloudflare blocked {target}")
                     break  # try next candidate
+                # 202 Accepted is often AWS WAF challenge (does not raise)
+                if resp.status_code >= 400 or _is_cloudflare_block(resp):
+                    logger.warning("Bot-block HTTP %s on %s — fallback", resp.status_code, target)
+                    last_err = RuntimeError(f"Bot-blocked {target} ({resp.status_code})")
+                    break
                 resp.raise_for_status()
                 html = resp.text or ""
-                if "just a moment" in html[:1500].lower() and "enable javascript" in html[:2000].lower():
-                    logger.warning("CF challenge HTML on %s", target)
-                    last_err = RuntimeError(f"Cloudflare challenge {target}")
+                low = html[:3000].lower()
+                if (
+                    ("just a moment" in low and "enable javascript" in low)
+                    or "awswafintegration" in low
+                    or "challenge-container" in low
+                    or ("gokuprops" in low and "challenge.js" in low)
+                ):
+                    logger.warning("WAF/CF challenge HTML on %s", target)
+                    last_err = RuntimeError(f"WAF challenge {target}")
                     break
                 # Strip wayback toolbar noise slightly
                 if "web.archive.org" in target:
