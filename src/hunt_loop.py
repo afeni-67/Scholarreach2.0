@@ -165,7 +165,7 @@ def topicker_loop(worker_id: str, max_runtime: float, idle_sleep: int):
             if time.time() - start >= max_runtime:
                 break
             try:
-                out = process_pdf_topic(pdf_url)
+                                out = process_pdf_topic(pdf_url)
                 m = meta.get(pdf_url) or {}
                 ok = hdb.save_topic(
                     key,
@@ -174,7 +174,8 @@ def topicker_loop(worker_id: str, max_runtime: float, idle_sleep: int):
                     pdf_url,
                     doi=m.get("doi") or "",
                     source_page=job.get("homepageUrl") or "",
-                    author_name=out.get("authorName"),  # None until EDIT LATER
+                    author_name=out.get("authorName"),
+                    emails=out.get("emails") or [],
                 )
                 if ok:
                     added += 1
@@ -186,7 +187,7 @@ def topicker_loop(worker_id: str, max_runtime: float, idle_sleep: int):
             hdb.db()["huntedjournals"].update_one(
                 {"key": key}, {"$set": {"pdfQueue": queue[len(batch):]}})
             if added:
-                hdb.bump_counts(key, topic_delta=added)
+                hdb.bump_counts(key, topic_delta=added, email_delta=added)
                 done += added
                 logger.info("topicker %s %s +%d topics", worker_id, key, added)
         except Exception:
