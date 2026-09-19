@@ -1,5 +1,5 @@
 """
-Hunt fleet loop (topic-only). processor.py untouched.
+Hunt fleet loop (topic + author email). Killswitch: HUNT_ENABLED. processor.py untouched.
 
 Role split by worker number (scales to any fleet size):
   worker_num % 3 == 1 → hunter (OpenAlex discover + validate)
@@ -196,6 +196,14 @@ def topicker_loop(worker_id: str, max_runtime: float, idle_sleep: int):
 
 
 def run_loop(max_runtime_seconds: int = 5 * 3600 + 1800, idle_sleep: int = 5):
+    """Killswitch: HUNT_ENABLED=false stops the entire journal hunt fleet."""
+    from src.config import HUNT_ENABLED
+    if not HUNT_ENABLED:
+        logger.warning(
+            "HUNT_ENABLED is FALSE — journal hunt fleet idle. "
+            "Set HUNT_ENABLED=true on Render/Actions to resume automated hunt (Pro catalog supply)."
+        )
+        return 0
     from src import hunt_db as hdb
     try:
         hdb.ensure_hunt_indexes()
