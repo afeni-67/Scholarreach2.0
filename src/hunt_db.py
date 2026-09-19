@@ -1,11 +1,11 @@
 """
-Mongo helpers for the hunt fleet (topic-only).
+Mongo helpers for the hunt fleet.
 
-Stores in the APP database (test) so the web app reads the same data:
+Stores in the APP database so the web app reads the same data:
 - huntedjournals : validated journal catalog
-- papertopics    : pre-extracted topic pool (no emails)
+- papertopics    : pre-extracted pool (topic + emails required)
 
-processor.py / app_jobs.py untouched.
+processor.py / extraction jobs still use their own collections.
 """
 import os
 from datetime import datetime, timezone
@@ -21,7 +21,9 @@ TOPICS_COL = "papertopics"
 def _client_or_connect():
     global _client
     if _client is None:
-        uri = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
+        uri = os.environ.get("MONGODB_URI") or os.environ.get("MONGO_URI") or (
+            "mongodb://localhost:27017"
+        )
         _client = MongoClient(uri, serverSelectionTimeoutMS=10000)
         _client.admin.command("ping")
     return _client
@@ -51,35 +53,55 @@ def upsert_journal(doc: dict):
 
 
 def claim_hunting_journal(worker_id: str):
-    """Hunters create new journals from OpenAlex; crawlers/topickers claim ready ones."""
-    # Journal needing PDF crawl
     j = db()[JOURNALS_COL].find_one({"status": "ready", "pdfQueued": {"$lt": 5}})
     return j
 
 
 def claim_topic_journal():
-    # Journal with queued PDFs but low topic count
     return db()[JOURNALS_COL].find_one(
         {"status": "ready"},
         sort=[("topicCount", ASCENDING)],
     )
 
 
-def save_topic(journal_key: str, title: str, topic: str, pdf_url: str, doi: str = "", source_page: str = "", author_name=None):
+def save_topic(
+    journal_key: str,
+    title: str,
+    topic: str,
+    pdf_url: str,
+    doi: str = "",
+    source_page: str = "",
+    author_name=None,
+    emails=None,
+):
+    """
+    Persist paper only when we have topic + at least one email.
+    Returns True if saved, False if skipped/failed.
+    """
+    emails = [str(e).strip().lower() for e in (emails or []) if e and "@" in str(e)]
+    emails = list(dict.fromkeys(emails))
+    if not emails:
+        return False
+    title = (title or topic or "Untitled paper")[:300]
+    topic = (topic or title)[:300]
     now = datetime.now(timezone.utc)
     try:
         db()[TOPICS_COL].update_one(
             {"pdfUrl": pdf_url},
-            {"$set": {
-                "journalKey": journal_key,
-                "title": title[:300],
-                "topic": (topic or title)[:300],
-                "pdfUrl": pdf_url,
-                "doi": (doi or "")[:200],
-                "sourcePage": (source_page or "")[:500],
-                "authorName": author_name,
-                "extractedAt": now,
-            }},
+            {
+                "$set": {
+                    "journalKey": journal_key,
+                    "title": title,
+                    "topic": topic,
+                    "emails": emails,
+                    "email": emails[0],  # primary for UI convenience
+                    "pdfUrl": pdf_url,
+                    "doi": (doi or "")[:200],
+                    "sourcePage": (source_page or "")[:500],
+                    "authorName": author_name,
+                    "extractedAt": now,
+                }
+            },
             upsert=True,
         )
         return True
@@ -87,11 +109,13 @@ def save_topic(journal_key: str, title: str, topic: str, pdf_url: str, doi: str 
         return False
 
 
-def bump_counts(key: str, pdf_delta: int = 0, topic_delta: int = 0):
+def bump_counts(key: str, pdf_delta: int = 0, topic_delta: int = 0, email_delta: int = 0):
+    inc = {"pdfQueued": pdf_delta, "topicCount": topic_delta}
+    if email_delta:
+        inc["emailCount"] = email_delta
     db()[JOURNALS_COL].update_one(
         {"key": key},
-        {"$inc": {"pdfQueued": pdf_delta, "topicCount": topic_delta},
-         "$set": {"updatedAt": datetime.now(timezone.utc)}},
+        {"$inc": inc, "$set": {"updatedAt": datetime.now(timezone.utc)}},
     )
 
 
@@ -99,4 +123,5 @@ def hunt_stats() -> dict:
     pipe = [{"$group": {"_id": "$status", "count": {"$sum": 1}}}]
     journals = {r["_id"]: r["count"] for r in db()[JOURNALS_COL].aggregate(pipe)}
     topics = db()[TOPICS_COL].estimated_document_count()
-    return {"journals": journals, "topics": topics}
+    with_email = db()[TOPICS_COL].count_documents({"emails.0": {"$exists": True}})
+    return {"journals": journals, "topics": topics, "withEmail": with_email}
