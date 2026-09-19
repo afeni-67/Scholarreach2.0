@@ -134,6 +134,56 @@ def download_pdf(url: str) -> bytes:
     raise last_err if last_err else RuntimeError(f"Failed to download PDF: {url}")
 
 
+
+def extract_title_and_emails(data: bytes) -> Tuple[Optional[str], List[str]]:
+    """Extract paper title + author emails from PDF bytes."""
+    title: Optional[str] = None
+    text_parts: List[str] = []
+
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        meta = reader.metadata
+        if meta:
+            raw = getattr(meta, "title", None)
+            if not raw and hasattr(meta, "get"):
+                try:
+                    raw = meta.get("/Title")
+                except Exception:
+                    raw = None
+            if raw and str(raw).strip() and str(raw).strip().lower() not in ("untitled", "null"):
+                title = str(raw).strip()[:300]
+        for page in reader.pages[:5]:
+            try:
+                text_parts.append(page.extract_text() or "")
+            except Exception:
+                pass
+    except Exception as e:
+        logger.debug("pypdf failed: %s", e)
+
+    joined = "\n".join(text_parts)
+    if len(joined.strip()) < 80:
+        try:
+            with pdfplumber.open(io.BytesIO(data)) as pdf:
+                for page in pdf.pages[:4]:
+                    try:
+                        text_parts.append(page.extract_text() or "")
+                    except Exception:
+                        pass
+            joined = "\n".join(text_parts)
+        except Exception as e:
+            logger.debug("pdfplumber failed: %s", e)
+
+    if not title:
+        for line in joined.splitlines():
+            line = line.strip()
+            if len(line) >= 12 and "@" not in line and not line.lower().startswith("http"):
+                title = line[:300]
+                break
+
+    emails = extract_emails_from_text(joined)
+    return title, emails
+
+
 def process_pdf_url(pdf_url: str) -> dict:
     """High-level: download + extract. Returns structured result.
 
