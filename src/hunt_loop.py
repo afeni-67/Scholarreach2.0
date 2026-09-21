@@ -165,7 +165,7 @@ def topicker_loop(worker_id: str, max_runtime: float, idle_sleep: int):
             if time.time() - start >= max_runtime:
                 break
             try:
-                                out = process_pdf_topic(pdf_url)
+                out = process_pdf_topic(pdf_url)
                 m = meta.get(pdf_url) or {}
                 ok = hdb.save_topic(
                     key,
