@@ -1,69 +1,18 @@
-name: Scholarreach Hunt (topic + email)
+name: Scholarreach Hunt (DEPRECATED — use processor)
 
 on:
-  # Separate fleet from processor.yml (custom-journal extract).
-  # Render cron */2 wakes this workflow independently.
   workflow_dispatch:
-    inputs:
-      max_hours:
-        description: "Max runtime hours for this run (default 5.5)"
-        required: false
-        default: "5.5"
 
-# No concurrency group — allows wave B while wave A still runs.
-# Processor.yml untouched — reserved for user custom-journal extraction.
+# DEPRECATED: Hunt is now 2 labeled jobs inside processor.yml (workers 19–20).
+# Do not dispatch this workflow from Render. Kept only so old links do not 404.
 
 jobs:
-  hunt:
+  notice:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-    strategy:
-      fail-fast: false
-      matrix:
-        worker: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: "pip"
-
-      - name: Install dependencies
+      - name: Deprecated
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Run hunt loop (worker ${{ matrix.worker }})
-        env:
-          MONGODB_URI: ${{ secrets.MONGODB_URI }}
-          MONGODB_DB: ${{ secrets.MONGODB_DB || 'test' }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_JOB: hunt-worker-${{ matrix.worker }}
-          HUNT_WORKER_NUM: ${{ matrix.worker }}
-          # Killswitch — must match repo secret HUNT_ENABLED=true|false
-          HUNT_ENABLED: ${{ secrets.HUNT_ENABLED }}
-        run: |
-          MAX_H="${{ github.event.inputs.max_hours || '5.5' }}"
-          MAX_S=$(python -c "print(int(float('$MAX_H') * 3600))")
-          echo "Starting hunt worker ${{ matrix.worker }} HUNT_ENABLED=${HUNT_ENABLED:-unset} (max ${MAX_S}s)..."
-          python -c "
-          from src.hunt_loop import run_loop
-          run_loop(max_runtime_seconds=$MAX_S, idle_sleep=5)
-          "
-
-      - name: Hunt status summary
-        if: always()
-        env:
-          MONGODB_URI: ${{ secrets.MONGODB_URI }}
-          MONGODB_DB: ${{ secrets.MONGODB_DB || 'test' }}
-        run: |
-          python -c "
-          from src import hunt_db
-          try:
-              print('Hunt status:', hunt_db.hunt_stats())
-          except Exception as e:
-              print('Could not fetch hunt status:', e)
-          "
+          echo "This workflow is deprecated."
+          echo "Hunt (topic+email) runs as matrix.role=hunt inside processor.yml."
+          echo "Cancel any queued runs of this workflow."
+          exit 0
