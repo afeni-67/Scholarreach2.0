@@ -1,8 +1,8 @@
 name: Scholarreach Processor
 
 on:
-  # Render wake only (every ~2 min). Single workflow:
-  # 40 extract (custom journals) + 40 hunt (topic+email) = 80 matrix jobs.
+  # Render wake only (every ~2 min). Custom-journal extraction only.
+  # Auto-hunt lives on a separate GitHub account/repo.
   workflow_dispatch:
     inputs:
       max_hours:
@@ -12,8 +12,7 @@ on:
   repository_dispatch:
     types: [enqueue, process]
 
-# Render wakeWorkers caps at 2 active workflow runs (Wave A + Wave B @ +3h).
-# Free-tier concurrent jobs may queue past ~20 slots (GitHub account limit).
+# Max 2 active runs via Render wakeWorkers (Wave A + Wave B @ +3h).
 
 jobs:
   process:
@@ -22,168 +21,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - worker: 1
-            role: extract
-          - worker: 2
-            role: extract
-          - worker: 3
-            role: extract
-          - worker: 4
-            role: extract
-          - worker: 5
-            role: extract
-          - worker: 6
-            role: extract
-          - worker: 7
-            role: extract
-          - worker: 8
-            role: extract
-          - worker: 9
-            role: extract
-          - worker: 10
-            role: extract
-          - worker: 11
-            role: extract
-          - worker: 12
-            role: extract
-          - worker: 13
-            role: extract
-          - worker: 14
-            role: extract
-          - worker: 15
-            role: extract
-          - worker: 16
-            role: extract
-          - worker: 17
-            role: extract
-          - worker: 18
-            role: extract
-          - worker: 19
-            role: extract
-          - worker: 20
-            role: extract
-          - worker: 21
-            role: extract
-          - worker: 22
-            role: extract
-          - worker: 23
-            role: extract
-          - worker: 24
-            role: extract
-          - worker: 25
-            role: extract
-          - worker: 26
-            role: extract
-          - worker: 27
-            role: extract
-          - worker: 28
-            role: extract
-          - worker: 29
-            role: extract
-          - worker: 30
-            role: extract
-          - worker: 31
-            role: extract
-          - worker: 32
-            role: extract
-          - worker: 33
-            role: extract
-          - worker: 34
-            role: extract
-          - worker: 35
-            role: extract
-          - worker: 36
-            role: extract
-          - worker: 37
-            role: extract
-          - worker: 38
-            role: extract
-          - worker: 39
-            role: extract
-          - worker: 40
-            role: extract
-          - worker: 41
-            role: hunt
-          - worker: 42
-            role: hunt
-          - worker: 43
-            role: hunt
-          - worker: 44
-            role: hunt
-          - worker: 45
-            role: hunt
-          - worker: 46
-            role: hunt
-          - worker: 47
-            role: hunt
-          - worker: 48
-            role: hunt
-          - worker: 49
-            role: hunt
-          - worker: 50
-            role: hunt
-          - worker: 51
-            role: hunt
-          - worker: 52
-            role: hunt
-          - worker: 53
-            role: hunt
-          - worker: 54
-            role: hunt
-          - worker: 55
-            role: hunt
-          - worker: 56
-            role: hunt
-          - worker: 57
-            role: hunt
-          - worker: 58
-            role: hunt
-          - worker: 59
-            role: hunt
-          - worker: 60
-            role: hunt
-          - worker: 61
-            role: hunt
-          - worker: 62
-            role: hunt
-          - worker: 63
-            role: hunt
-          - worker: 64
-            role: hunt
-          - worker: 65
-            role: hunt
-          - worker: 66
-            role: hunt
-          - worker: 67
-            role: hunt
-          - worker: 68
-            role: hunt
-          - worker: 69
-            role: hunt
-          - worker: 70
-            role: hunt
-          - worker: 71
-            role: hunt
-          - worker: 72
-            role: hunt
-          - worker: 73
-            role: hunt
-          - worker: 74
-            role: hunt
-          - worker: 75
-            role: hunt
-          - worker: 76
-            role: hunt
-          - worker: 77
-            role: hunt
-          - worker: 78
-            role: hunt
-          - worker: 79
-            role: hunt
-          - worker: 80
-            role: hunt
-    name: ${{ matrix.role }} (${{ matrix.worker }})
+        worker: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40]
+    name: extract (${{ matrix.worker }})
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -199,34 +38,23 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run ${{ matrix.role }} worker ${{ matrix.worker }}
+      - name: Run extract worker ${{ matrix.worker }}
         env:
           MONGODB_URI: ${{ secrets.MONGODB_URI }}
           MONGODB_DB: ${{ secrets.MONGODB_DB || 'test' }}
           GITHUB_TOKEN: ${{ secrets.GH_PAT || github.token }}
           GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_JOB: ${{ matrix.role }}-worker-${{ matrix.worker }}
-          HUNT_WORKER_NUM: ${{ matrix.worker }}
-          HUNT_ENABLED: ${{ secrets.HUNT_ENABLED }}
-          WORKER_ROLE: ${{ matrix.role }}
+          GITHUB_JOB: extract-worker-${{ matrix.worker }}
         run: |
           MAX_H="${{ github.event.inputs.max_hours || '5.5' }}"
           MAX_S=$(python -c "print(int(float('$MAX_H') * 3600))")
-          ROLE="${{ matrix.role }}"
-          echo "Starting role=$ROLE worker=${{ matrix.worker }} HUNT_ENABLED=${HUNT_ENABLED:-unset} (max ${MAX_S}s)..."
-          if [ "$ROLE" = "hunt" ]; then
-            python -c "
-          from src.hunt_loop import run_loop
-          run_loop(max_runtime_seconds=$MAX_S, idle_sleep=5)
-          "
-          else
-            python -c "
+          echo "Starting extract worker ${{ matrix.worker }} (max ${MAX_S}s)..."
+          python -c "
           from src.processor import run_loop
           run_loop(max_runtime_seconds=$MAX_S, idle_sleep=3)
           "
-          fi
 
-      - name: Status summary
+      - name: Queue status summary
         if: always()
         env:
           MONGODB_URI: ${{ secrets.MONGODB_URI }}
@@ -237,10 +65,5 @@ jobs:
               from src import db
               print('Extract queue:', db.count_by_status())
           except Exception as e:
-              print('Extract status skip:', e)
-          try:
-              from src import hunt_db
-              print('Hunt status:', hunt_db.hunt_stats())
-          except Exception as e:
-              print('Hunt status skip:', e)
+              print('Status skip:', e)
           "
