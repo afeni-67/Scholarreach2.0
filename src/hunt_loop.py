@@ -4,7 +4,7 @@ Hunt fleet loop (topic + author email). Killswitch: HUNT_ENABLED. processor.py u
 Role split by worker number (scales to any fleet size):
   worker_num % 3 == 1 → hunter (OpenAlex discover + validate)
   worker_num % 3 == 2 → crawler (direct PDF links per journal)
-  worker_num % 3 == 0 → topicker (PDF → title/topic pool)
+  worker_num % 3 == 0 → topicker (PDF → title/topic + emails; skip if no email)
 
 20 workers/run × 2 overlapping waves ≈ 40 hunters/crawlers/topickers.
 With 30 workers the split is exactly 10/10/10.
@@ -33,7 +33,7 @@ def hunter_loop(worker_id: str, max_runtime: float, idle_sleep: int):
     from src import validate as v
     from src import hunt_db as hdb
     sess = requests.Session()
-    sess.headers.update({"User-Agent": "Scholarreach-Hunt/1.0 (topic-only hunter)"})
+    sess.headers.update({"User-Agent": "Scholarreach-Hunt/1.0 (topic+email hunter)"})
     start = time.time()
     done = 0
     try:
@@ -189,7 +189,7 @@ def topicker_loop(worker_id: str, max_runtime: float, idle_sleep: int):
             if added:
                 hdb.bump_counts(key, topic_delta=added, email_delta=added)
                 done += added
-                logger.info("topicker %s %s +%d topics", worker_id, key, added)
+                logger.info("topicker %s %s +%d topic+email rows", worker_id, key, added)
         except Exception:
             pass
     return done
