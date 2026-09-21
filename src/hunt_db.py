@@ -13,7 +13,7 @@ from pymongo import MongoClient, ASCENDING
 
 _client = None
 
-APP_DB = "test"
+APP_DB = os.getenv("MONGODB_DB") or os.getenv("MONGO_DB") or "test"
 JOURNALS_COL = "huntedjournals"
 TOPICS_COL = "papertopics"
 
