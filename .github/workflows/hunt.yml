@@ -1,7 +1,8 @@
-name: Scholarreach Hunt (topic-only)
+name: Scholarreach Hunt (topic + email)
 
 on:
-  # Separate from processor.yml — Render wake-hunt starts wave A, then wave B at +3h.
+  # Separate fleet from processor.yml (custom-journal extract).
+  # Render cron */2 wakes this workflow independently.
   workflow_dispatch:
     inputs:
       max_hours:
@@ -10,7 +11,7 @@ on:
         default: "5.5"
 
 # No concurrency group — allows wave B while wave A still runs.
-# Same 20-job free-tier pattern as processor; processor.yml untouched.
+# Processor.yml untouched — reserved for user custom-journal extraction.
 
 jobs:
   hunt:
@@ -38,14 +39,16 @@ jobs:
       - name: Run hunt loop (worker ${{ matrix.worker }})
         env:
           MONGODB_URI: ${{ secrets.MONGODB_URI }}
-          MONGODB_DB: ${{ secrets.MONGODB_DB || 'scholarreach' }}
+          MONGODB_DB: ${{ secrets.MONGODB_DB || 'test' }}
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_JOB: hunt-worker-${{ matrix.worker }}
           HUNT_WORKER_NUM: ${{ matrix.worker }}
+          # Killswitch — must match repo secret HUNT_ENABLED=true|false
+          HUNT_ENABLED: ${{ secrets.HUNT_ENABLED }}
         run: |
           MAX_H="${{ github.event.inputs.max_hours || '5.5' }}"
           MAX_S=$(python -c "print(int(float('$MAX_H') * 3600))")
-          echo "Starting hunt worker ${{ matrix.worker }} (max ${MAX_S}s)..."
+          echo "Starting hunt worker ${{ matrix.worker }} HUNT_ENABLED=${HUNT_ENABLED:-unset} (max ${MAX_S}s)..."
           python -c "
           from src.hunt_loop import run_loop
           run_loop(max_runtime_seconds=$MAX_S, idle_sleep=5)
@@ -55,7 +58,7 @@ jobs:
         if: always()
         env:
           MONGODB_URI: ${{ secrets.MONGODB_URI }}
-          MONGODB_DB: ${{ secrets.MONGODB_DB || 'scholarreach' }}
+          MONGODB_DB: ${{ secrets.MONGODB_DB || 'test' }}
         run: |
           python -c "
           from src import hunt_db
