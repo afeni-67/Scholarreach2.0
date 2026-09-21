@@ -1,7 +1,7 @@
 name: Scholarreach Processor
 
 on:
-  # Render wakeWorkers only — starts wave A, then wave B at +3h, etc.
+  # Render wake only (every ~2 min). Single workflow: extract + hunt labels.
   workflow_dispatch:
     inputs:
       max_hours:
@@ -11,10 +11,9 @@ on:
   repository_dispatch:
     types: [enqueue, process]
 
-# No concurrency group — allows wave B to start while wave A is still running.
-# GitHub Free max concurrent jobs is 20: if both waves have 20 matrix jobs,
-# the second wave is accepted but its jobs queue until slots free. wakeWorkers
-# still caps at 2 active workflow runs so we do not pile up forever.
+# Max 2 active runs via Render wakeWorkers. One matrix of 20 jobs:
+# workers 1–18 = custom-journal extract, 19–20 = hunt (topic+email).
+# No separate hunt.yml dispatch → no extra queue storm.
 
 jobs:
   process:
@@ -23,7 +22,50 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        worker: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+        include:
+          # --- extract fleet (custom journals) ---
+          - worker: 1
+            role: extract
+          - worker: 2
+            role: extract
+          - worker: 3
+            role: extract
+          - worker: 4
+            role: extract
+          - worker: 5
+            role: extract
+          - worker: 6
+            role: extract
+          - worker: 7
+            role: extract
+          - worker: 8
+            role: extract
+          - worker: 9
+            role: extract
+          - worker: 10
+            role: extract
+          - worker: 11
+            role: extract
+          - worker: 12
+            role: extract
+          - worker: 13
+            role: extract
+          - worker: 14
+            role: extract
+          - worker: 15
+            role: extract
+          - worker: 16
+            role: extract
+          - worker: 17
+            role: extract
+          - worker: 18
+            role: extract
+          # --- hunt fleet (topic + email pool) ---
+          - worker: 19
+            role: hunt
+          - worker: 20
+            role: hunt
+    name: ${{ matrix.role }} (${{ matrix.worker }})
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -39,32 +81,48 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run processor loop (worker ${{ matrix.worker }})
+      - name: Run ${{ matrix.role }} worker ${{ matrix.worker }}
         env:
           MONGODB_URI: ${{ secrets.MONGODB_URI }}
-          MONGODB_DB: ${{ secrets.MONGODB_DB || 'scholarreach' }}
+          MONGODB_DB: ${{ secrets.MONGODB_DB || 'test' }}
           GITHUB_TOKEN: ${{ secrets.GH_PAT || github.token }}
           GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_JOB: worker-${{ matrix.worker }}
+          GITHUB_JOB: ${{ matrix.role }}-worker-${{ matrix.worker }}
+          HUNT_WORKER_NUM: ${{ matrix.worker }}
+          HUNT_ENABLED: ${{ secrets.HUNT_ENABLED }}
+          WORKER_ROLE: ${{ matrix.role }}
         run: |
           MAX_H="${{ github.event.inputs.max_hours || '5.5' }}"
           MAX_S=$(python -c "print(int(float('$MAX_H') * 3600))")
-          echo "Starting Scholarreach worker ${{ matrix.worker }} (max ${MAX_S}s)..."
-          python -c "
+          ROLE="${{ matrix.role }}"
+          echo "Starting role=$ROLE worker=${{ matrix.worker }} HUNT_ENABLED=${HUNT_ENABLED:-unset} (max ${MAX_S}s)..."
+          if [ "$ROLE" = "hunt" ]; then
+            python -c "
+          from src.hunt_loop import run_loop
+          run_loop(max_runtime_seconds=$MAX_S, idle_sleep=5)
+          "
+          else
+            python -c "
           from src.processor import run_loop
           run_loop(max_runtime_seconds=$MAX_S, idle_sleep=3)
           "
+          fi
 
-      - name: Queue status summary
+      - name: Status summary
         if: always()
         env:
           MONGODB_URI: ${{ secrets.MONGODB_URI }}
-          MONGODB_DB: ${{ secrets.MONGODB_DB || 'scholarreach' }}
+          MONGODB_DB: ${{ secrets.MONGODB_DB || 'test' }}
         run: |
           python -c "
-          from src import db
           try:
-              print('Queue status:', db.count_by_status())
+              from src import db
+              print('Extract queue:', db.count_by_status())
           except Exception as e:
-              print('Could not fetch status:', e)
+              print('Extract status skip:', e)
+          try:
+              from src import hunt_db
+              print('Hunt status:', hunt_db.hunt_stats())
+          except Exception as e:
+              print('Hunt status skip:', e)
           "
