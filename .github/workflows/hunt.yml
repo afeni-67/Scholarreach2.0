@@ -1,18 +1,17 @@
-name: Scholarreach Hunt (DEPRECATED — use processor)
+name: Scholarreach Hunt (MOVED)
 
 on:
   workflow_dispatch:
 
-# DEPRECATED: Hunt is now 2 labeled jobs inside processor.yml (workers 19–20).
-# Do not dispatch this workflow from Render. Kept only so old links do not 404.
+# Auto-hunt moved off this account. Do not enable.
+# Custom-journal extract uses processor.yml only.
 
 jobs:
   notice:
     runs-on: ubuntu-latest
     steps:
-      - name: Deprecated
+      - name: Moved
         run: |
-          echo "This workflow is deprecated."
-          echo "Hunt (topic+email) runs as matrix.role=hunt inside processor.yml."
-          echo "Cancel any queued runs of this workflow."
+          echo "Auto-hunt was removed from this repo."
+          echo "Use the dedicated hunt GitHub account/repo."
           exit 0
