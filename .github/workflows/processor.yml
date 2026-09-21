@@ -1,7 +1,8 @@
 name: Scholarreach Processor
 
 on:
-  # Render wake only (every ~2 min). Single workflow: extract + hunt labels.
+  # Render wake only (every ~2 min). Single workflow:
+  # 40 extract (custom journals) + 40 hunt (topic+email) = 80 matrix jobs.
   workflow_dispatch:
     inputs:
       max_hours:
@@ -11,9 +12,8 @@ on:
   repository_dispatch:
     types: [enqueue, process]
 
-# Max 2 active runs via Render wakeWorkers. One matrix of 20 jobs:
-# workers 1–18 = custom-journal extract, 19–20 = hunt (topic+email).
-# No separate hunt.yml dispatch → no extra queue storm.
+# Render wakeWorkers caps at 2 active workflow runs (Wave A + Wave B @ +3h).
+# Free-tier concurrent jobs may queue past ~20 slots (GitHub account limit).
 
 jobs:
   process:
@@ -23,7 +23,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # --- extract fleet (custom journals) ---
           - worker: 1
             role: extract
           - worker: 2
@@ -60,10 +59,129 @@ jobs:
             role: extract
           - worker: 18
             role: extract
-          # --- hunt fleet (topic + email pool) ---
           - worker: 19
-            role: hunt
+            role: extract
           - worker: 20
+            role: extract
+          - worker: 21
+            role: extract
+          - worker: 22
+            role: extract
+          - worker: 23
+            role: extract
+          - worker: 24
+            role: extract
+          - worker: 25
+            role: extract
+          - worker: 26
+            role: extract
+          - worker: 27
+            role: extract
+          - worker: 28
+            role: extract
+          - worker: 29
+            role: extract
+          - worker: 30
+            role: extract
+          - worker: 31
+            role: extract
+          - worker: 32
+            role: extract
+          - worker: 33
+            role: extract
+          - worker: 34
+            role: extract
+          - worker: 35
+            role: extract
+          - worker: 36
+            role: extract
+          - worker: 37
+            role: extract
+          - worker: 38
+            role: extract
+          - worker: 39
+            role: extract
+          - worker: 40
+            role: extract
+          - worker: 41
+            role: hunt
+          - worker: 42
+            role: hunt
+          - worker: 43
+            role: hunt
+          - worker: 44
+            role: hunt
+          - worker: 45
+            role: hunt
+          - worker: 46
+            role: hunt
+          - worker: 47
+            role: hunt
+          - worker: 48
+            role: hunt
+          - worker: 49
+            role: hunt
+          - worker: 50
+            role: hunt
+          - worker: 51
+            role: hunt
+          - worker: 52
+            role: hunt
+          - worker: 53
+            role: hunt
+          - worker: 54
+            role: hunt
+          - worker: 55
+            role: hunt
+          - worker: 56
+            role: hunt
+          - worker: 57
+            role: hunt
+          - worker: 58
+            role: hunt
+          - worker: 59
+            role: hunt
+          - worker: 60
+            role: hunt
+          - worker: 61
+            role: hunt
+          - worker: 62
+            role: hunt
+          - worker: 63
+            role: hunt
+          - worker: 64
+            role: hunt
+          - worker: 65
+            role: hunt
+          - worker: 66
+            role: hunt
+          - worker: 67
+            role: hunt
+          - worker: 68
+            role: hunt
+          - worker: 69
+            role: hunt
+          - worker: 70
+            role: hunt
+          - worker: 71
+            role: hunt
+          - worker: 72
+            role: hunt
+          - worker: 73
+            role: hunt
+          - worker: 74
+            role: hunt
+          - worker: 75
+            role: hunt
+          - worker: 76
+            role: hunt
+          - worker: 77
+            role: hunt
+          - worker: 78
+            role: hunt
+          - worker: 79
+            role: hunt
+          - worker: 80
             role: hunt
     name: ${{ matrix.role }} (${{ matrix.worker }})
     steps:
