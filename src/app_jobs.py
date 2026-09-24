@@ -6,6 +6,7 @@ The Render app creates documents in the `test.extractionjobs` collection
 run discovery + PDF extraction, and continuously update progress so the
 UI can poll live results for the exact user.
 """
+import re
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 from bson import ObjectId
