@@ -53,7 +53,30 @@ def upsert_journal(doc: dict):
 
 
 def claim_hunting_journal(worker_id: str):
-    j = db()[JOURNALS_COL].find_one({"status": "ready", "pdfQueued": {"$lt": 5}})
+    """Claim a ready journal for crawling. Prefer PKP Beacon; OpenAlex disabled."""
+    now = datetime.now(timezone.utc)
+    # Prefer PKP with empty/small queue
+    j = db()[JOURNALS_COL].find_one_and_update(
+        {
+            "source": "pkp_beacon",
+            "status": "ready",
+            "$or": [
+                {"pdfQueued": {"$exists": False}},
+                {"pdfQueued": {"$lt": 50}},
+                {"pdfQueue.0": {"$exists": False}},
+            ],
+        },
+        {
+            "$set": {
+                "status": "crawling",
+                "claimedBy": worker_id,
+                "claimExpires": datetime.fromtimestamp(now.timestamp() + 7200, tz=timezone.utc),
+                "updatedAt": now,
+            }
+        },
+        sort=[("totalRecordCount", -1)],
+        return_document=True,
+    )
     return j
 
 
