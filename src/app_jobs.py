@@ -265,38 +265,72 @@ def get_user_journal_processed_pdfs(user_id, journal: str) -> set:
     """
     Papers this user already extracted for this journal (any past job).
     Used so a new "scrape more" job skips rediscovering/re-reading those PDFs.
+    Source of truth: jobemails (where UI leads live) + processedPdfUrls on past jobs
+    + UserJournal.processedPaperUrls + extractedemails.
     """
     urls = set()
     if not user_id:
         return urls
-    q = {"userId": user_id}
-    # extractedemails may store journal; paperUrl is enough to skip
+
+    uid_list = [user_id]
     try:
-        for doc in extracted_emails().find(q, {"paperUrl": 1, "journal": 1}):
+        from bson import ObjectId
+        if isinstance(user_id, str) and ObjectId.is_valid(user_id):
+            uid_list.append(ObjectId(user_id))
+        elif isinstance(user_id, ObjectId):
+            uid_list.append(str(user_id))
+    except Exception:
+        pass
+
+    # 1) jobemails for this user + journal (primary lead store)
+    try:
+        q = {"userId": {"$in": uid_list}}
+        if journal:
+            q["$or"] = [
+                {"journal": journal},
+                {"journal": {"$regex": f"^{journal}$", "$options": "i"}},
+            ]
+        for doc in job_emails().find(q, {"paperUrl": 1}):
+            u = (doc.get("paperUrl") or "").strip()
+            if u:
+                urls.add(u)
+    except Exception:
+        pass
+
+    # 2) past jobs for same user+journal → processedPdfUrls arrays
+    try:
+        jq = {"userId": {"$in": uid_list}}
+        if journal:
+            jq["journal"] = journal
+        for job in extraction_jobs().find(jq, {"processedPdfUrls": 1}):
+            for u in job.get("processedPdfUrls") or []:
+                if u:
+                    urls.add(str(u).strip())
+    except Exception:
+        pass
+
+    # 3) extractedemails (legacy)
+    try:
+        for doc in extracted_emails().find({"userId": {"$in": uid_list}}, {"paperUrl": 1, "journal": 1}):
             u = (doc.get("paperUrl") or "").strip()
             if not u:
                 continue
             j = (doc.get("journal") or "").strip()
-            if journal and j and j != journal and not (
-                journal.startswith("custom-") and j.startswith("custom-")
-            ):
-                # if journal field set and differs, skip
-                if j.lower() != str(journal).lower():
-                    continue
+            if journal and j and j.lower() != str(journal).lower():
+                continue
             urls.add(u)
     except Exception:
         pass
-    # Also UserJournal.processedPaperUrls if present
+
+    # 4) UserJournal.processedPaperUrls
     try:
-        uj = user_journals().find_one({"userId": user_id, "slug": journal})
+        uj = user_journals().find_one({"userId": {"$in": uid_list}, "slug": journal})
         if not uj and journal:
-            uj = user_journals().find_one({"userId": user_id, "seedUrl": journal})
+            uj = user_journals().find_one({"userId": {"$in": uid_list}, "seedUrl": journal})
         if uj:
             for u in uj.get("processedPaperUrls") or []:
                 if u:
                     urls.add(u)
-            for u in uj.get("discoveredPdfUrls") or []:
-                pass  # discovered but not processed — still try
     except Exception:
         pass
     return urls

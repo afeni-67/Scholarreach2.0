@@ -143,6 +143,46 @@ def process_app_extraction_job(job: dict, worker_id: str) -> None:
             "Job %s smart-continue: skip %d already-done PDFs (%d user-journal history), %d remaining",
             job_id, before - len(pdf_urls), len(user_done), len(pdf_urls),
         )
+
+    # If nothing left after skip, expand discovery (archive/issues) instead of ending at 0
+    if not pdf_urls and listing_urls:
+        try:
+            from src.scraper import generic_discover, find_pagination_links, expand_ojs_archive_issues
+            import requests as _req
+            expand_seeds = list(listing_urls)
+            sess = _req.Session()
+            sess.headers.update({"User-Agent": "Scholarreach/2.0 continue-bot"})
+            for seed in list(listing_urls)[:3]:
+                try:
+                    r = sess.get(seed, timeout=30, allow_redirects=True)
+                    html = r.text or ""
+                    for link in find_pagination_links(html, seed)[:30]:
+                        if link not in expand_seeds:
+                            expand_seeds.append(link)
+                    try:
+                        ojs = expand_ojs_archive_issues(html, seed)
+                        for iss in (ojs.get("issues") or [])[:40]:
+                            if iss not in expand_seeds:
+                                expand_seeds.append(iss)
+                        for ap in (ojs.get("archive_pages") or [])[:20]:
+                            if ap not in expand_seeds:
+                                expand_seeds.append(ap)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            logger.info("Job %s continue-expand: %d seed URLs after archive/issue fan-out", job_id, len(expand_seeds))
+            more = generic_discover(expand_seeds, max_pages=500, max_depth=7, max_pdfs=3000)
+            extra = []
+            for pdoc in more:
+                u = pdoc.get("pdf_url")
+                if u and u not in already and u not in extra:
+                    extra.append(u)
+            pdf_urls = extra
+            logger.info("Job %s continue-expand found %d new PDFs beyond history", job_id, len(pdf_urls))
+        except Exception as e:
+            logger.warning("Job %s continue-expand failed: %s", job_id, e)
+
     # Persist full discovery list so next job can continue without full re-crawl when possible
     try:
         app_jobs.save_journal_progress(
