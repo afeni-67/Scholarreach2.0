@@ -907,6 +907,127 @@ def generic_discover(
     return pdfs[:max_pdfs]
 
 
+def iter_generic_discover(
+    seed_urls: List[str],
+    *,
+    max_pages: int = MAX_PAGES,
+    max_depth: int = MAX_DEPTH,
+    max_pdfs: int = MAX_PDFS,
+    skip_pdfs: Optional[Set[str]] = None,
+):
+    """
+    Streaming BFS: yield each new PDF dict as soon as it is found on a page.
+    Does not wait for the full journal crawl to finish.
+    """
+    if not seed_urls:
+        return
+
+    session = _session()
+    queue: deque = deque()
+    visited: Set[str] = set()
+    seen_pdfs: Set[str] = set(skip_pdfs or set())
+    pages_fetched = 0
+    yielded = 0
+
+    ordered = sorted([s for s in seed_urls if s], key=_seed_priority)
+    for s in ordered:
+        queue.append((s, 0))
+
+    while queue and pages_fetched < max_pages and yielded < max_pdfs:
+        url, depth = queue.popleft()
+        if url in visited:
+            continue
+        visited.add(url)
+
+        try:
+            html = _get(url, session)
+            pages_fetched += 1
+        except Exception as e:
+            logger.warning("Fetch failed %s: %s", url, e)
+            continue
+
+        links = extract_links_from_html(html, url)
+
+        if re.search(r"issue/archive|issue/current|issue/view/\d+|past-issues|/archive", url, re.I):
+            expanded = expand_ojs_archive_issues(html, url)
+            for iss in expanded["issues"]:
+                if iss not in visited:
+                    queue.append((iss, depth))
+            for ap in expanded["archive_pages"]:
+                if ap not in visited:
+                    queue.append((ap, depth))
+
+        page_pdfs: List[Dict[str, Any]] = []
+        page_kind = classify_link(url)
+        if page_kind in ("article", None) or any(l["kind"] == "pdf" for l in links):
+            for pdf in extract_pdfs_from_article_page(html, url):
+                if pdf in seen_pdfs:
+                    continue
+                looks_synth = bool(re.search(r"article/download/\d+(/\d+)?(/pdf)?/?$", pdf, re.I))
+                if looks_synth and not probe_pdf_url(pdf, session):
+                    seen_pdfs.add(pdf)
+                    continue
+                seen_pdfs.add(pdf)
+                page_pdfs.append(
+                    {
+                        "title": None,
+                        "authors": None,
+                        "pdf_url": pdf,
+                        "doi": None,
+                        "source": "article_page",
+                        "page_url": url,
+                    }
+                )
+
+        for link in links:
+            kind = link["kind"]
+            href = link["url"]
+            if kind == "pdf":
+                if href in seen_pdfs:
+                    continue
+                looks_synth = bool(re.search(r"article/download/\d+(/\d+)?(/pdf)?/?$", href, re.I))
+                if looks_synth and not probe_pdf_url(href, session):
+                    seen_pdfs.add(href)
+                    continue
+                seen_pdfs.add(href)
+                page_pdfs.append(
+                    {
+                        "title": link.get("text") or None,
+                        "authors": None,
+                        "pdf_url": href,
+                        "doi": None,
+                        "source": "link",
+                        "page_url": url,
+                    }
+                )
+            elif kind == "article":
+                if depth < max_depth and href not in visited:
+                    queue.append((href, depth + 1))
+            elif kind == "listing" and depth < max_depth:
+                if href not in visited:
+                    queue.append((href, depth + 1))
+
+        if depth < max_depth:
+            for next_url in find_pagination_links(html, url):
+                if next_url not in visited:
+                    queue.append((next_url, depth + 1))
+
+        for p in page_pdfs:
+            yielded += 1
+            yield p
+            if yielded >= max_pdfs:
+                return
+
+        if pages_fetched % 10 == 0:
+            logger.info(
+                "Stream discover: pages=%d yielded_pdfs=%d queue=%d",
+                pages_fetched,
+                yielded,
+                len(queue),
+            )
+
+
+
 def discover_papers(url: str) -> List[Dict[str, Any]]:
     """
     Dispatch: IJETRM-specific fast path, otherwise generic crawler.

@@ -7,6 +7,7 @@ Priority:
 2. Fall back to the internal jobs collection (legacy / seed jobs).
 """
 import logging
+import threading
 import os
 import time
 import uuid
@@ -28,12 +29,12 @@ logger = logging.getLogger("scholarreach.processor")
 
 def process_app_extraction_job(job: dict, worker_id: str) -> None:
     """
-    Full pipeline for a UI-created ExtractionJob:
-    - Resolve seed / listing URLs for the journal
-    - Discover PDF links
-    - Download + extract title/emails
-    - Push emails into jobemails / extractedemails
-    - Continuously update progress/stage so the UI polls live data
+    Stream pipeline for UI ExtractionJob:
+    - Resolve seeds (archive/current fallbacks)
+    - BFS discover → extract each PDF immediately (do not wait for full journal)
+    - Hard stop when emails_collected >= target (plan limit)
+    - Checkpoint last paper + processed URLs for resume on next claim
+    - Fail fast if no PDFs after a short probe
     """
     job_id = job["_id"]
     journal = job.get("journal") or "ijddt"
@@ -42,7 +43,7 @@ def process_app_extraction_job(job: dict, worker_id: str) -> None:
 
     app_jobs.update_job_progress(
         job_id,
-        stage=f"Discovering papers for {journal}…",
+        stage=f"Streaming extract for {journal}…",
         progress=2,
         status="running",
     )
@@ -52,250 +53,216 @@ def process_app_extraction_job(job: dict, worker_id: str) -> None:
     seed_pdfs = list(seeds.get("pdfUrls") or [])
     sample_urls = list(seeds.get("samplePaperUrls") or [])
     logger.info(
-        "Job %s seeds listing=%s pdfs=%d samples=%d",
-        job_id, listing_urls[:3], len(seed_pdfs), len(sample_urls),
+        "Job %s seeds listing=%s pdfs=%d samples=%d target=%d",
+        job_id, listing_urls[:3], len(seed_pdfs), len(sample_urls), target,
     )
 
-    # Fallback built-in listing pages when no custom seeds exist
     if not listing_urls and not seed_pdfs and not sample_urls:
         if journal == "ijetrm":
             listing_urls = [
                 "https://ijetrm.com/issue/?volume=current",
                 "https://ijetrm.com/issue/?volume=February~2026",
-                "https://ijetrm.com/issue/?volume=March~2026",
             ]
         elif journal == "ijddt":
             listing_urls = ["https://ijddt.com/"]
         elif "isjem" in (journal or "").lower():
             listing_urls = ["https://isjem.com/past-issues/"]
 
-    app_jobs.update_job_progress(
-        job_id,
-        stage=f"Discovering papers for {journal} (generic crawler)…",
-        progress=5,
-        current_url=(listing_urls[0] if listing_urls else ""),
-    )
+    expanded = list(listing_urls)
+    for base in list(listing_urls):
+        b = (base or "").rstrip("/")
+        if not b or "/issue/" in b:
+            continue
+        for suffix in (
+            "/issue/archive",
+            "/issue/current",
+            "/index.php/issue/archive",
+            "/index.php/issue/current",
+        ):
+            cand = b + suffix
+            if cand not in expanded:
+                expanded.append(cand)
+    listing_urls = expanded
 
-    from src.scraper import discover_from_seeds
-    import threading
-
-    # Keep heartbeat alive during long multi-issue discovery so another worker
-    # does not "reclaim" and appear to cancel this job.
-    stop_hb = threading.Event()
-
-    def _hb_loop():
-        n = 0
-        while not stop_hb.wait(25):
-            n += 1
-            try:
-                app_jobs.update_job_progress(
-                    job_id,
-                    stage=f"Discovering papers for {journal}… (still crawling issues)",
-                    progress=min(18, 5 + n),
-                )
-            except Exception:
-                pass
-
-    hb_thread = threading.Thread(target=_hb_loop, daemon=True)
-    hb_thread.start()
-    try:
-        papers = discover_from_seeds(
-            listing_urls=listing_urls,
-            pdf_urls=seed_pdfs,
-            sample_paper_urls=sample_urls,
-        )
-    except Exception as e:
-        stop_hb.set()
-        logger.exception("Discovery failed for job %s: %s", job_id, e)
-        app_jobs.complete_app_job(
-            job_id,
-            success=False,
-            stage=f"Discovery failed: {str(e)[:100]}",
-        )
-        return
-    finally:
-        stop_hb.set()
-
-    pdf_urls = []
-    seen = set()
-    for p in papers:
-        u = p.get("pdf_url")
-        if u and u not in seen:
-            seen.add(u)
-            pdf_urls.append(u)
-
-    if not pdf_urls:
-        app_jobs.complete_app_job(
-            job_id,
-            success=False,
-            stage="No PDF links found for this journal",
-        )
-        return
-
-    # --- Checkpoint: skip PDFs already processed (this job + this user's journal history) ---
-    already = app_jobs.get_already_processed_pdfs(job_id)
-    user_done = app_jobs.get_user_journal_processed_pdfs(user_id, journal)
-    already = already | user_done
-    if already:
-        before = len(pdf_urls)
-        pdf_urls = [u for u in pdf_urls if u not in already]
-        logger.info(
-            "Job %s smart-continue: skip %d already-done PDFs (%d user-journal history), %d remaining",
-            job_id, before - len(pdf_urls), len(user_done), len(pdf_urls),
-        )
-
-    # If nothing left after skip, expand discovery (archive/issues) instead of ending at 0
-    if not pdf_urls and listing_urls:
-        try:
-            from src.scraper import generic_discover, find_pagination_links, expand_ojs_archive_issues
-            import requests as _req
-            expand_seeds = list(listing_urls)
-            sess = _req.Session()
-            sess.headers.update({"User-Agent": "Scholarreach/2.0 continue-bot"})
-            for seed in list(listing_urls)[:3]:
-                try:
-                    r = sess.get(seed, timeout=30, allow_redirects=True)
-                    html = r.text or ""
-                    for link in find_pagination_links(html, seed)[:30]:
-                        if link not in expand_seeds:
-                            expand_seeds.append(link)
-                    try:
-                        ojs = expand_ojs_archive_issues(html, seed)
-                        for iss in (ojs.get("issues") or [])[:40]:
-                            if iss not in expand_seeds:
-                                expand_seeds.append(iss)
-                        for ap in (ojs.get("archive_pages") or [])[:20]:
-                            if ap not in expand_seeds:
-                                expand_seeds.append(ap)
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-            logger.info("Job %s continue-expand: %d seed URLs after archive/issue fan-out", job_id, len(expand_seeds))
-            more = generic_discover(expand_seeds, max_pages=500, max_depth=7, max_pdfs=3000)
-            extra = []
-            for pdoc in more:
-                u = pdoc.get("pdf_url")
-                if u and u not in already and u not in extra:
-                    extra.append(u)
-            pdf_urls = extra
-            logger.info("Job %s continue-expand found %d new PDFs beyond history", job_id, len(pdf_urls))
-        except Exception as e:
-            logger.warning("Job %s continue-expand failed: %s", job_id, e)
-
-    # Persist full discovery list so next job can continue without full re-crawl when possible
-    try:
-        app_jobs.save_journal_progress(
-            user_id, journal,
-            discovered_pdfs=(list(already) + pdf_urls)[:3000],
-            listing_urls=listing_urls,
-        )
-    except Exception:
-        pass
-
-    # Restore email/paper counts from DB so UI doesn't reset
+    already = app_jobs.get_user_journal_processed_pdfs(user_id, journal=journal, job_id=job_id)
     existing_emails = int(job.get("emailsCollected") or 0)
     existing_papers = int(job.get("papersProcessed") or 0)
-    if existing_emails == 0:
-        # count from jobemails as source of truth
-        try:
-            existing_emails = app_jobs.job_emails().count_documents({"jobId": job_id})
-        except Exception:
-            pass
-
-    app_jobs.update_job_progress(
-        job_id,
-        stage=f"Found {len(pdf_urls) + len(already)} PDFs ({len(already)} done, {len(pdf_urls)} left) — extracting…",
-        progress=max(20, min(90, int(100 * len(already) / max(len(already) + len(pdf_urls), 1)))),
-        papers_processed=existing_papers or len(already),
-        emails_collected=existing_emails,
-    )
-
-    if not pdf_urls:
-        app_jobs.complete_app_job(
-            job_id,
-            success=True,
-            stage=f"Done — {existing_emails} emails (all discovered PDFs already processed)",
-        )
-        return
-
     emails_total = existing_emails
-    papers_done = existing_papers or len(already)
+    papers_done = existing_papers
     errors = 0
+    found_any_pdf = False
+    checkpoint_urls = list(already)[:3000]
+    last_pdf = job.get("lastPaperUrl") or job.get("currentUrl") or ""
 
-    # Parallel PDF extraction inside this worker (biggest speed win).
-    # 6 concurrent downloads per worker × up to 20 workers ≈ high throughput,
-    # while still being somewhat polite to a single journal host.
-    PARALLEL = 6
-    total_pdfs = len(pdf_urls)
-    # Cap work to ~2× target papers as a safety bound
-    work_list = pdf_urls[: max(target * 8, 200)]  # allow multi-issue journals
+    pending_seed_pdfs = []
+    for u in seed_pdfs + sample_urls:
+        if u and u not in already:
+            pending_seed_pdfs.append(u)
 
-    def _one(pdf_url: str):
+    from src.scraper import iter_generic_discover
+
+    def _extract_one(pdf_url: str):
         try:
             result = process_pdf_url(pdf_url)
             return pdf_url, result, None
         except Exception as e:
             return pdf_url, None, e
 
-    with ThreadPoolExecutor(max_workers=PARALLEL) as pool:
-        futures = {pool.submit(_one, u): u for u in work_list}
-        done_count = 0
-        for fut in as_completed(futures):
+    def _checkpoint(pdf_url: str, stage: str, progress: float):
+        nonlocal checkpoint_urls, last_pdf
+        last_pdf = pdf_url
+        if pdf_url not in checkpoint_urls:
+            checkpoint_urls.append(pdf_url)
+        app_jobs.mark_pdf_processed(job_id, pdf_url, user_id=user_id, journal=journal)
+        app_jobs.update_job_progress(
+            job_id,
+            stage=stage,
+            current_url=pdf_url,
+            progress=min(95, progress),
+            papers_processed=papers_done,
+            emails_collected=emails_total,
+        )
+        try:
+            app_jobs.extraction_jobs().update_one(
+                {"_id": job_id},
+                {"$set": {
+                    "lastPaperUrl": pdf_url,
+                    "lastProcessedPdfUrl": pdf_url,
+                    "updatedAt": datetime.now(timezone.utc),
+                }},
+            )
+        except Exception:
+            pass
+        if papers_done % 5 == 0:
+            app_jobs.save_journal_progress(
+                user_id,
+                journal,
+                discovered_pdfs=checkpoint_urls[-500:],
+                processed_pdf=pdf_url,
+                listing_urls=listing_urls[:50] if listing_urls else None,
+            )
+
+    stop_hb = {"v": False}
+
+    def _hb_loop():
+        while not stop_hb["v"]:
+            try:
+                app_jobs.update_job_progress(
+                    job_id,
+                    stage=f"Streaming extract… {emails_total}/{target} emails, {papers_done} papers",
+                    emails_collected=emails_total,
+                    papers_processed=papers_done,
+                    current_url=last_pdf or "",
+                )
+            except Exception:
+                pass
+            time.sleep(25)
+
+    hb_thread = threading.Thread(target=_hb_loop, daemon=True)
+    hb_thread.start()
+
+    try:
+        for pdf_url in pending_seed_pdfs:
             if emails_total >= target:
-                # Cancel remaining work
-                for f in futures:
-                    f.cancel()
                 break
-
-            pdf_url, result, err = fut.result()
-            done_count += 1
-
+            found_any_pdf = True
+            pdf_url, result, err = _extract_one(pdf_url)
             if err is not None:
                 errors += 1
-                app_jobs.mark_pdf_processed(job_id, pdf_url, user_id=user_id, journal=journal)  # don't retry this URL forever
-                if errors <= 5 or errors % 20 == 0:
-                    logger.warning("Extract failed %s: %s", pdf_url, err)
+                app_jobs.mark_pdf_processed(job_id, pdf_url, user_id=user_id, journal=journal)
                 continue
-
             title = (result or {}).get("title") or ""
             emails = (result or {}).get("emails") or []
             added = app_jobs.push_emails_for_job(job, emails, paper_url=pdf_url, title=title)
-            app_jobs.mark_pdf_processed(job_id, pdf_url, user_id=user_id, journal=journal)
             emails_total += added
             papers_done += 1
+            _checkpoint(
+                pdf_url,
+                stage=f"Extracting… {emails_total}/{target} emails ({papers_done} papers)",
+                progress=5 + 90 * min(emails_total, target) / max(target, 1),
+            )
 
-            # Progress write every few papers (less Mongo overhead = faster)
-            if papers_done % 3 == 0 or added > 0:
+        if emails_total < target and listing_urls:
+            pdf_iter = iter_generic_discover(
+                listing_urls,
+                max_pages=400,
+                max_depth=6,
+                max_pdfs=max(target * 10, 500),
+                skip_pdfs=set(already) | set(pending_seed_pdfs),
+            )
+            for paper in pdf_iter:
+                if emails_total >= target:
+                    break
+                pdf_url = (paper or {}).get("pdf_url") or ""
+                if not pdf_url or pdf_url in already:
+                    continue
+                found_any_pdf = True
+                pdf_url, result, err = _extract_one(pdf_url)
+                already.add(pdf_url)
+                if err is not None:
+                    errors += 1
+                    app_jobs.mark_pdf_processed(job_id, pdf_url, user_id=user_id, journal=journal)
+                    if errors <= 5 or errors % 25 == 0:
+                        logger.warning("Extract failed %s: %s", pdf_url, err)
+                    continue
+                title = (result or {}).get("title") or ""
+                emails = (result or {}).get("emails") or []
+                added = app_jobs.push_emails_for_job(job, emails, paper_url=pdf_url, title=title)
+                emails_total += added
+                papers_done += 1
                 preview = ", ".join(emails[:3]) if emails else "(no emails)"
-                app_jobs.update_job_progress(
-                    job_id,
-                    stage=f"Extracting paper {papers_done}/{min(total_pdfs, len(work_list))}…",
-                    current_url=pdf_url,
-                    progress=min(95, 20 + int(70 * papers_done / max(min(total_pdfs, len(work_list)), 1))),
-                    papers_processed=papers_done,
-                    emails_collected=emails_total,
-                    batch_preview=preview,
+                _checkpoint(
+                    pdf_url,
+                    stage=f"Extracting… {emails_total}/{target} emails ({papers_done} papers) · {preview[:60]}",
+                    progress=5 + 90 * min(emails_total, target) / max(target, 1),
                 )
+                if added:
+                    logger.info(
+                        "Job %s …%s → +%d emails (total %d/%d)",
+                        job_id, pdf_url[-40:], added, emails_total, target,
+                    )
 
-            if added:
-                logger.info(
-                    "Job %s paper …%s → +%d emails (total %d)",
-                    job_id, pdf_url[-40:], added, emails_total,
-                )
+        if not found_any_pdf and papers_done == 0 and emails_total == 0:
+            app_jobs.complete_app_job(
+                job_id,
+                success=False,
+                stage="No PDF links found after short probe (retryable — check seed / archive URL)",
+            )
+            app_jobs.update_job_progress(
+                job_id,
+                progress=100,
+                emails_collected=0,
+                papers_processed=0,
+                status="failed",
+            )
+            logger.warning("Job %s fail-fast: no PDFs for %s", job_id, journal)
+            return
 
-    # Final status
-    final_stage = f"Done — {emails_total} emails from {papers_done} papers"
-    if emails_total == 0:
-        final_stage = f"Finished — no emails found ({papers_done} papers, {errors} errors)"
-    app_jobs.complete_app_job(job_id, success=True, stage=final_stage)
-    app_jobs.update_job_progress(
-        job_id,
-        progress=100,
-        emails_collected=emails_total,
-        papers_processed=papers_done,
-    )
-    logger.info("Completed app job %s → %s", job_id, final_stage)
+        if emails_total >= target:
+            final_stage = f"Done — {emails_total} emails (hit plan limit {target}) from {papers_done} papers"
+        elif emails_total == 0:
+            final_stage = f"Finished — no emails found ({papers_done} papers, {errors} errors)"
+        else:
+            final_stage = f"Done — {emails_total} emails from {papers_done} papers (stream exhausted)"
+
+        app_jobs.save_journal_progress(
+            user_id,
+            journal,
+            discovered_pdfs=checkpoint_urls[-500:],
+            listing_urls=listing_urls[:50] if listing_urls else None,
+        )
+        app_jobs.complete_app_job(job_id, success=True, stage=final_stage)
+        app_jobs.update_job_progress(
+            job_id,
+            progress=100,
+            emails_collected=emails_total,
+            papers_processed=papers_done,
+            current_url=last_pdf or "",
+        )
+        logger.info("Completed app job %s → %s", job_id, final_stage)
+    finally:
+        stop_hb["v"] = True
+
 
 
 def process_discover(job: dict) -> dict:
