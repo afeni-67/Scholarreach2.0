@@ -261,7 +261,7 @@ def mark_pdf_processed(job_id, pdf_url: str, user_id=None, journal: str = None):
 
 
 
-def get_user_journal_processed_pdfs(user_id, journal: str) -> set:
+def get_user_journal_processed_pdfs(user_id, journal: str, job_id=None) -> set:
     """
     Papers this user already extracted for this journal (any past job).
     Used so a new "scrape more" job skips rediscovering/re-reading those PDFs.
@@ -271,6 +271,21 @@ def get_user_journal_processed_pdfs(user_id, journal: str) -> set:
     urls = set()
     if not user_id:
         return urls
+
+    # Current job checkpoint (resume mid-run)
+    if job_id is not None:
+        try:
+            for doc in job_emails().find({"jobId": job_id}, {"paperUrl": 1}):
+                u = (doc.get("paperUrl") or "").strip()
+                if u:
+                    urls.add(u)
+            job = extraction_jobs().find_one({"_id": job_id}, {"processedPdfUrls": 1})
+            if job:
+                for u in job.get("processedPdfUrls") or []:
+                    if u:
+                        urls.add(str(u).strip())
+        except Exception:
+            pass
 
     uid_list = [user_id]
     try:

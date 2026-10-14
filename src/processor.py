@@ -84,7 +84,7 @@ def process_app_extraction_job(job: dict, worker_id: str) -> None:
                 expanded.append(cand)
     listing_urls = expanded
 
-    already = app_jobs.get_user_journal_processed_pdfs(user_id, journal=journal, job_id=job_id)
+    already = app_jobs.get_user_journal_processed_pdfs(user_id, journal, job_id=job_id)
     existing_emails = int(job.get("emailsCollected") or 0)
     existing_papers = int(job.get("papersProcessed") or 0)
     emails_total = existing_emails
