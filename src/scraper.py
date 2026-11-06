@@ -4,6 +4,7 @@ Journal page scrapers — generic discovery for any open-access journal.
 Supports:
 - IJETRM (citation_pdf_url meta)
 - OJS (article/view, article/download)
+- IJTIMES custom archives.php + OJS dual frontend (issue/view + article/download)
 - DSpace / EPrints / handle-based repos
 - Direct PDF links
 - Article pages that embed or link to PDFs
@@ -37,8 +38,13 @@ def _seed_priority(url: str) -> int:
         return 1
     if re.search(r"issue/archive|past-issues|/archive", u):
         return 2
+    # IJTIMES custom volume/issue cards
+    if re.search(r"archives\.php\?vol=\d+", u):
+        return 2
     if re.search(r"article/view/", u):
         return 3
+    if "ijtimes" in u and "archives.php" in u:
+        return 2
     return 5
 
 
@@ -100,6 +106,59 @@ def expand_ojs_archive_issues(html: str, base_url: str) -> Dict[str, List[str]]:
         "issues": sorted(issues, key=lambda u: int(re.search(r"(\d+)$", u).group(1)) if re.search(r"(\d+)$", u) else 0),
         "archive_pages": sorted(archive_pages),
     }
+
+
+def expand_ijtimes_seeds(seed_urls: List[str]) -> List[str]:
+    """
+    IJTIMES has two front-ends:
+      1) Modern custom PHP: https://ijtimes.com/archives.php[?vol=N&iss=M]
+      2) Legacy OJS: https://ijtimes.com/index.php/ijtimes/issue/archive
+         and issue/view/{id} + article/download/{id}/{galley}
+
+    Volume 4 (2018) and Volume 5 (2019) alone contain ~2800 papers.
+    When any seed touches ijtimes.com we inject the OJS archive + a dense
+    band of known issue/view IDs so the crawler does not stop at the marketing
+    homepage or a sparse archives.php card page.
+    """
+    out: List[str] = []
+    seen: Set[str] = set()
+    is_ijtimes = False
+
+    def add(u: str):
+        u = (u or "").strip()
+        if not u or u in seen:
+            return
+        seen.add(u)
+        out.append(u)
+
+    for s in seed_urls or []:
+        add(s)
+        if "ijtimes.com" in (s or "").lower():
+            is_ijtimes = True
+
+    if not is_ijtimes:
+        return out
+
+    # Primary high-yield entry points
+    add("https://ijtimes.com/index.php/ijtimes/issue/archive")
+    add("https://www.ijtimes.com/index.php/ijtimes/issue/archive")
+    add("https://ijtimes.com/archives.php")
+
+    # Custom archives cards for the densest volumes
+    for vol in (4, 5, 6, 3, 7, 8, 9, 10):
+        add(f"https://ijtimes.com/archives.php?vol={vol}")
+        # Issues 1..20 cover regular + special conference issues
+        for iss in range(1, 21):
+            add(f"https://ijtimes.com/archives.php?vol={vol}&iss={iss}")
+
+    # OJS issue/view IDs observed on the live archive (rough band covering vol 3–10)
+    # Safe sequential fill — probe_pdf_url / dead-link skip handles gaps.
+    for issue_id in range(20, 90):
+        add(f"https://ijtimes.com/index.php/ijtimes/issue/view/{issue_id}")
+        add(f"https://www.ijtimes.com/index.php/ijtimes/issue/view/{issue_id}")
+
+    logger.info("IJTIMES seed expand: %d → %d URLs", len(seed_urls or []), len(out))
+    return out
 
 
 def probe_pdf_url(url: str, session: Optional[requests.Session] = None) -> bool:
@@ -508,6 +567,8 @@ def classify_link(url: str, text_hint: str = "") -> Optional[str]:
     # Listing / archive / issue / volume TOC pages (ARPN, many society journals)
     if re.search(r"issue/(view|archive|current)", u, re.I):
         return "listing"
+    if re.search(r"archives\.php", u, re.I):
+        return "listing"
     if re.search(r"/archive(\.htm|/|$|\?)", u, re.I) or u.rstrip("/").endswith("archive.htm"):
         return "listing"
     if re.search(r"list-\d+", u, re.I):
@@ -790,6 +851,8 @@ def generic_discover(
     pages_fetched = 0
 
     # Prefer current issue / issue/view seeds first (benchmark: better PDF yield)
+    # IJTIMES dual-frontend expansion (custom archives.php + OJS issue/view)
+    seed_urls = expand_ijtimes_seeds(list(seed_urls or []))
     ordered = sorted([s for s in seed_urls if s], key=_seed_priority)
     for s in ordered:
         queue.append((s, 0))
@@ -812,7 +875,7 @@ def generic_discover(
         # --- Progressive issue/volume walk (OJS and similar) ---
         # Archive pages list many Volume X / Issue Y → issue/view/{id}.
         # Expand ALL issues + archive pagination so we do not stop at one TOC page.
-        if re.search(r"issue/archive|issue/current|issue/view/\d+|past-issues|/archive", url, re.I):
+        if re.search(r"issue/archive|issue/current|issue/view/\d+|past-issues|/archive|archives\.php", url, re.I):
             expanded = expand_ojs_archive_issues(html, url)
             for iss in expanded["issues"]:
                 if iss not in visited:
@@ -929,6 +992,8 @@ def iter_generic_discover(
     pages_fetched = 0
     yielded = 0
 
+    # IJTIMES dual-frontend expansion (custom archives.php + OJS issue/view)
+    seed_urls = expand_ijtimes_seeds(list(seed_urls or []))
     ordered = sorted([s for s in seed_urls if s], key=_seed_priority)
     for s in ordered:
         queue.append((s, 0))
@@ -948,7 +1013,7 @@ def iter_generic_discover(
 
         links = extract_links_from_html(html, url)
 
-        if re.search(r"issue/archive|issue/current|issue/view/\d+|past-issues|/archive", url, re.I):
+        if re.search(r"issue/archive|issue/current|issue/view/\d+|past-issues|/archive|archives\.php", url, re.I):
             expanded = expand_ojs_archive_issues(html, url)
             for iss in expanded["issues"]:
                 if iss not in visited:
@@ -1030,12 +1095,16 @@ def iter_generic_discover(
 
 def discover_papers(url: str) -> List[Dict[str, Any]]:
     """
-    Dispatch: IJETRM-specific fast path, otherwise generic crawler.
+    Dispatch: IJETRM-specific fast path, IJTIMES dual-frontend, otherwise generic.
     """
     domain = urlparse(url).netloc.lower()
     # IJETRM (+ common typo ijertm.com)
     if "ijetrm.com" in domain or "ijertm.com" in domain:
         return scrape_ijetrm_issue(url)
+    # IJTIMES: expand to OJS archive + volume cards before generic crawl
+    if "ijtimes.com" in domain:
+        seeds = expand_ijtimes_seeds([url])
+        return generic_discover(seeds, max_pages=MAX_PAGES, max_depth=MAX_DEPTH, max_pdfs=MAX_PDFS)
     return generic_discover([url])
 
 
