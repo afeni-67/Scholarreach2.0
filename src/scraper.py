@@ -139,10 +139,13 @@ def expand_ijtimes_seeds(seed_urls: List[str]) -> List[str]:
     if not is_ijtimes:
         return out
 
-    # Primary high-yield entry points
+    # Primary high-yield entry points (live + Wayback — host is frequently unreachable)
     add("https://ijtimes.com/index.php/ijtimes/issue/archive")
     add("https://www.ijtimes.com/index.php/ijtimes/issue/archive")
     add("https://ijtimes.com/archives.php")
+    add("https://web.archive.org/web/2/https://ijtimes.com/index.php/ijtimes/issue/archive")
+    add("https://web.archive.org/web/2/https://www.ijtimes.com/index.php/ijtimes/issue/archive")
+    add("https://web.archive.org/web/2/https://ijtimes.com/archives.php")
 
     # Custom archives cards for the densest volumes
     for vol in (4, 5, 6, 3, 7, 8, 9, 10):
@@ -156,6 +159,9 @@ def expand_ijtimes_seeds(seed_urls: List[str]) -> List[str]:
     for issue_id in range(20, 90):
         add(f"https://ijtimes.com/index.php/ijtimes/issue/view/{issue_id}")
         add(f"https://www.ijtimes.com/index.php/ijtimes/issue/view/{issue_id}")
+        # Wayback fallback for flaky origin
+        if issue_id % 3 == 0:  # every 3rd to avoid explosion
+            add(f"https://web.archive.org/web/2/https://ijtimes.com/index.php/ijtimes/issue/view/{issue_id}")
 
     logger.info("IJTIMES seed expand: %d → %d URLs", len(seed_urls or []), len(out))
     return out
